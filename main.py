@@ -29,5 +29,5 @@ def importar_produtos():
     else:
         return jsonify({"erro": "Erro ao buscar produtos", "status": response.status_code}), 500
 
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=80)
+#if __name__ == "__main__":
+ #   app.run(host="0.0.0.0", port=80)
