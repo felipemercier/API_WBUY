@@ -24,10 +24,24 @@ def importar_produtos():
 
     if response.status_code == 200:
         data = response.json()
-        produtos = data.get("data", [])
-        return jsonify(produtos)
+        produtos_raw = data.get("data", [])
+
+        # Pega só nome e erp_id
+        produtos_processados = []
+        for item in produtos_raw:
+            nome = item.get("produto", "sem nome")
+            erp_id = "sem erp_id"
+
+            estoque = item.get("estoque", [])
+            if estoque and isinstance(estoque, list) and len(estoque) > 0:
+                erp_id = estoque[0].get("erp_id", "sem erp_id")
+
+            produtos_processados.append({
+                "nome": nome,
+                "erp_id": erp_id
+            })
+
+        return jsonify(produtos_processados)
+
     else:
         return jsonify({"erro": "Erro ao buscar produtos", "status": response.status_code}), 500
-
-#if __name__ == "__main__":
- #   app.run(host="0.0.0.0", port=80)
