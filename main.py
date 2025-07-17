@@ -13,6 +13,7 @@ CORS(app)
 def home():
     return "API da Martier rodando."
 
+# 🔄 ROTA DE PRODUTOS EXISTENTE
 @app.route('/importar-produtos', methods=['GET'])
 def importar_produtos():
     headers = {
@@ -36,7 +37,6 @@ def importar_produtos():
                 erp_id = variacao.get("erp_id", "sem erp_id")
                 tamanho = "sem tamanho"
 
-                # Procura pela variação com nome "Tamanho"
                 variacoes = variacao.get("variacao", {})
                 if variacoes.get("nome") == "Tamanho":
                     tamanho = variacoes.get("valor", "sem tamanho")
@@ -50,3 +50,27 @@ def importar_produtos():
         return jsonify(produtos_filtrados)
 
     return jsonify({"erro": "Erro ao buscar produtos", "status": response.status_code}), 500
+
+# ✅ NOVA ROTA PARA OBSERVAÇÕES POR PEDIDO
+@app.route('/observacoes/<pedido_id>', methods=['GET'])
+def buscar_observacoes(pedido_id):
+    headers = {
+        "Authorization": os.getenv("WBUY_TOKEN"),
+        "Content-Type": "application/json"
+    }
+    url = f"https://sistema.sistemawbuy.com.br/api/v1/order/{pedido_id}"
+
+    try:
+        response = requests.get(url, headers=headers)
+        if response.status_code == 200:
+            data = response.json()
+            observacoes = data["data"][0].get("observacoes", "")
+            return jsonify({"observacoes": observacoes})
+        else:
+            return jsonify({"erro": "Erro ao buscar pedido", "status": response.status_code}), 500
+    except Exception as e:
+        return jsonify({"erro": str(e)}), 500
+
+if __name__ == '__main__':
+    app.run()
+
