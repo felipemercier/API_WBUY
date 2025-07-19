@@ -1,7 +1,7 @@
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
+from flask_cors import CORS
 import requests
 import os
-from flask_cors import CORS
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -9,26 +9,52 @@ load_dotenv()
 app = Flask(__name__)
 CORS(app)
 
-@app.route('/')
-def home():
-    return "API da Martier rodando."
+# 🔐 Token da WBuy (vem do .env)
+TOKEN = os.getenv("WBUY_TOKEN")
 
-# 🔄 ROTA DE PRODUTOS EXISTENTE
+# 🔧 Headers padrão para requisições na API WBuy
+HEADERS = {
+    "Authorization": f"Bearer {TOKEN}",
+    "Content-Type": "application/json"
+}
+
+API_URL = "https://sistema.sistemawbuy.com.br/api/v1"
+
+@app.route("/")
+def home():
+    return "API da Martier rodando com todas as rotas!"
+
+# ✅ LISTAR PEDIDOS COM STATUS 16 (disponível para retirada)
+@app.route("/api/pedidos")
+def listar_pedidos():
+    url = f"{API_URL}/order?status=16&limit=100"
+    response = requests.get(url, headers=HEADERS)
+    data = response.json().get("data", [])
+    return jsonify(data)
+
+# ✅ CONCLUIR PEDIDO
+@app.route("/api/concluir", methods=["POST"])
+def concluir_pedido():
+    pedido_id = request.json.get("id")
+    url = f"{API_URL}/order/{pedido_id}"
+    payload = {
+        "status_id": "7",  # Concluído
+        "info_status": "Pedido concluído via painel"
+    }
+    response = requests.put(url, json=payload, headers=HEADERS)
+    return jsonify({"success": response.ok}), response.status_code
+
+# ✅ IMPORTAR PRODUTOS ATIVOS COM VARIAÇÕES
 @app.route('/importar-produtos', methods=['GET'])
 def importar_produtos():
-    headers = {
-        "Authorization": os.getenv("WBUY_TOKEN"),
-        "Content-Type": "application/json"
-    }
-    url = "https://sistema.sistemawbuy.com.br/api/v1/product/?ativo=1&limit=9999&complete=1"
-    response = requests.get(url, headers=headers)
+    url = f"{API_URL}/product/?ativo=1&limit=9999&complete=1"
+    response = requests.get(url, headers=HEADERS)
 
     if response.status_code == 200:
         data = response.json()
         produtos_raw = data.get("data", [])
 
         produtos_filtrados = []
-
         for produto in produtos_raw:
             nome = produto.get("produto", "sem nome")
             estoque = produto.get("estoque", [])
@@ -51,17 +77,12 @@ def importar_produtos():
 
     return jsonify({"erro": "Erro ao buscar produtos", "status": response.status_code}), 500
 
-# ✅ NOVA ROTA PARA OBSERVAÇÕES POR PEDIDO
+# ✅ OBSERVAÇÕES DO PEDIDO POR ID
 @app.route('/observacoes/<pedido_id>', methods=['GET'])
 def buscar_observacoes(pedido_id):
-    headers = {
-        "Authorization": os.getenv("WBUY_TOKEN"),
-        "Content-Type": "application/json"
-    }
-    url = f"https://sistema.sistemawbuy.com.br/api/v1/order/{pedido_id}"
-
+    url = f"{API_URL}/order/{pedido_id}"
     try:
-        response = requests.get(url, headers=headers)
+        response = requests.get(url, headers=HEADERS)
         if response.status_code == 200:
             data = response.json()
             observacoes = data["data"][0].get("observacoes", "")
@@ -71,6 +92,5 @@ def buscar_observacoes(pedido_id):
     except Exception as e:
         return jsonify({"erro": str(e)}), 500
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     app.run()
-
