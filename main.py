@@ -1,4 +1,4 @@
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, make_response
 from flask_cors import CORS
 import requests
 import os
@@ -7,7 +7,8 @@ from dotenv import load_dotenv
 load_dotenv()
 
 app = Flask(__name__)
-CORS(app)
+# CORS explícito (inclui preflight/OPTIONS automaticamente)
+CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=False)
 
 # 🔐 Token da WBuy (vem do .env)
 TOKEN = os.getenv("WBUY_TOKEN")
@@ -20,50 +21,81 @@ HEADERS = {
 
 API_URL = "https://sistema.sistemawbuy.com.br/api/v1"
 
+
 @app.route("/")
 def home():
     return "API da Martier rodando com todas as rotas!"
 
-# ✅ LISTAR PEDIDOS COM STATUS 16 (disponível para retirada)
+
+# ✅ LISTAR PEDIDOS (por padrão, status 16 = Disponível para retirada)
 @app.route("/api/pedidos")
 def listar_pedidos():
-    url = f"{API_URL}/order?status=16&limit=100"
-    response = requests.get(url, headers=HEADERS)
-    data = response.json().get("data", [])
-    return jsonify(data)
+    status = request.args.get("status", "16")
+    url = f"{API_URL}/order?status={status}&limit=100"
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=30)
+        if not r.ok:
+            # Repassa o erro bruto da WBuy p/ facilitar diagnóstico
+            return make_response(r.text, r.status_code)
 
-# ✅ CONCLUIR PEDIDO
+        data = r.json().get("data", [])
+        if not isinstance(data, list):
+            data = []
+        return jsonify(data)
+    except Exception as e:
+        return jsonify({"erro": str(e)}), 500
+
+
+# ✅ CONCLUIR PEDIDO (altera status para 7 = Concluído)
 @app.route("/api/concluir", methods=["POST"])
 def concluir_pedido():
-    pedido_id = request.json.get("id")
-    url = f"{API_URL}/order/{pedido_id}"
+    body = request.get_json(silent=True) or {}
+    pedido_id = body.get("id")
+    if not pedido_id:
+        return jsonify({"success": False, "error": "id é obrigatório"}), 400
+
+    # Endpoint específico para status
+    url = f"{API_URL}/order/status/{pedido_id}"
     payload = {
-        "status_id": "7",  # Concluído
+        "status": "7",  # Concluído
         "info_status": "Pedido concluído via painel"
     }
-    response = requests.put(url, json=payload, headers=HEADERS)
-    return jsonify({"success": response.ok}), response.status_code
+
+    try:
+        r = requests.put(url, json=payload, headers=HEADERS, timeout=30)
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+    # 204 No Content também representa sucesso na WBuy
+    if r.status_code in (200, 201, 202, 204):
+        return jsonify({"success": True}), 200
+
+    # Se falhar, devolve o corpo do erro
+    return make_response(r.text, r.status_code)
+
 
 # ✅ IMPORTAR PRODUTOS ATIVOS COM VARIAÇÕES
-@app.route('/importar-produtos', methods=['GET'])
+@app.route("/importar-produtos", methods=["GET"])
 def importar_produtos():
     url = f"{API_URL}/product/?ativo=1&limit=9999&complete=1"
-    response = requests.get(url, headers=HEADERS)
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=60)
+        if not r.ok:
+            return make_response(r.text, r.status_code)
 
-    if response.status_code == 200:
-        data = response.json()
+        data = r.json()
         produtos_raw = data.get("data", [])
-
         produtos_filtrados = []
+
         for produto in produtos_raw:
             nome = produto.get("produto", "sem nome")
-            estoque = produto.get("estoque", [])
+            estoque = produto.get("estoque", []) or []
 
             for variacao in estoque:
                 erp_id = variacao.get("erp_id", "sem erp_id")
                 tamanho = "sem tamanho"
 
-                variacoes = variacao.get("variacao", {})
+                variacoes = variacao.get("variacao", {}) or {}
                 if variacoes.get("nome") == "Tamanho":
                     tamanho = variacoes.get("valor", "sem tamanho")
 
@@ -74,23 +106,31 @@ def importar_produtos():
                 })
 
         return jsonify(produtos_filtrados)
-
-    return jsonify({"erro": "Erro ao buscar produtos", "status": response.status_code}), 500
-
-# ✅ OBSERVAÇÕES DO PEDIDO POR ID
-@app.route('/observacoes/<pedido_id>', methods=['GET'])
-def buscar_observacoes(pedido_id):
-    url = f"{API_URL}/order/{pedido_id}"
-    try:
-        response = requests.get(url, headers=HEADERS)
-        if response.status_code == 200:
-            data = response.json()
-            observacoes = data["data"][0].get("observacoes", "")
-            return jsonify({"observacoes": observacoes})
-        else:
-            return jsonify({"erro": "Erro ao buscar pedido", "status": response.status_code}), 500
     except Exception as e:
         return jsonify({"erro": str(e)}), 500
 
+
+# ✅ OBSERVAÇÕES DO PEDIDO POR ID
+@app.route("/observacoes/<pedido_id>", methods=["GET"])
+def buscar_observacoes(pedido_id):
+    url = f"{API_URL}/order/{pedido_id}"
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=30)
+        if not r.ok:
+            return make_response(r.text, r.status_code)
+
+        data = r.json().get("data")
+        if isinstance(data, list) and data:
+            observacoes = data[0].get("observacoes", "")
+        elif isinstance(data, dict):
+            observacoes = data.get("observacoes", "")
+        else:
+            observacoes = ""
+        return jsonify({"observacoes": observacoes})
+    except Exception as e:
+        return jsonify({"erro": str(e)}), 500
+
+
 if __name__ == "__main__":
-    app.run()
+    # Compatível com Render/Heroku etc.
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
