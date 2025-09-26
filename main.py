@@ -9,19 +9,16 @@ load_dotenv()
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=False)
 
-# =================== CONFIG ===================
 API_URL = "https://sistema.sistemawbuy.com.br/api/v1"
 TOKEN = os.getenv("WBUY_TOKEN", "").strip()
 HEADERS = {"Authorization": f"Bearer {TOKEN}", "Accept": "application/json"}
 SANDBOX = os.getenv("SANDBOX", "0") == "1" or not TOKEN
 
-# =================== HELPERS ==================
 def _to_cents(v):
     if v is None:
         return 0
     s = str(v).strip()
     try:
-        # aceita "21,74", "21.74", 21.74
         if "," in s and "." in s:
             s = s.replace(".", "").replace(",", ".")
         elif "," in s:
@@ -35,24 +32,14 @@ def _to_cents(v):
             return 0
 
 def _extract_shipping_and_tracking(order_dict):
-    """
-    Retorna (shipping_total_em_centavos, tracking_str) aceitando:
-    - 'shipping_total' (centavos)
-    - 'totals.shipping' (centavos)
-    - 'frete.valor' (decimal)
-    E tracking em: frete.rastreo/rastreio, rastreo/rastreio, tracking
-    """
     if not isinstance(order_dict, dict):
         return 0, None
-
     candidates = [
         order_dict.get("shipping_total"),
         (order_dict.get("totals") or {}).get("shipping"),
     ]
-
     frete = order_dict.get("frete") or {}
     candidates.append(_to_cents(frete.get("valor")))
-
     tracking = (
         frete.get("rastreo")
         or frete.get("rastreio")
@@ -60,30 +47,27 @@ def _extract_shipping_and_tracking(order_dict):
         or order_dict.get("rastreio")
         or order_dict.get("tracking")
     )
-
     for c in candidates:
         cents = _to_cents(c)
         if cents > 0:
             return cents, tracking
-
     return 0, tracking
 
 def _ok_json(d):
     return jsonify({k: v for k, v in d.items() if v is not None})
 
-# =================== PING =====================
+# ------------------ PING ------------------
 @app.route("/api/wbuy/ping")
 def ping():
     if SANDBOX:
         return jsonify({"ok": True, "sandbox": True})
     try:
-        url = f"{API_URL}/order?limit=1"
-        r = requests.get(url, headers=HEADERS, timeout=20)
+        r = requests.get(f"{API_URL}/order?limit=1", headers=HEADERS, timeout=20)
         return jsonify({"ok": r.ok})
     except Exception:
         return jsonify({"ok": False})
 
-# ======= ORDER BY ID ==========================
+# ----------- ORDER BY ID ------------------
 @app.route("/api/wbuy/order/<order_id>")
 def order_by_id(order_id):
     debug = request.args.get("debug") == "1"
@@ -94,24 +78,19 @@ def order_by_id(order_id):
             "shipping_total": 2174,
             "tracking": "AM000000000BR"
         })
-
     url = f"{API_URL}/order/{order_id}?complete=1"
     try:
         r = requests.get(url, headers=HEADERS, timeout=30)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
-
     if not r.ok:
         return make_response(r.text, r.status_code)
-
     j = r.json()
     data = j.get("data")
     if isinstance(data, list) and data:
         data = data[0]
-
     if not isinstance(data, dict):
         return _ok_json({"order_id": str(order_id), "shipping_total": 0, "tracking": None})
-
     shipping, tracking = _extract_shipping_and_tracking(data)
     return _ok_json({
         "debug": {"hit": url} if debug else None,
@@ -120,12 +99,11 @@ def order_by_id(order_id):
         "tracking": tracking,
     })
 
-# ======= ORDER BY TRACKING ====================
+# -------- ORDER BY TRACKING ---------------
 @app.route("/api/wbuy/order")
 def order_by_tracking():
     tracking = (request.args.get("tracking") or "").upper().strip()
     debug = request.args.get("debug") == "1"
-
     if not tracking:
         return jsonify({"error": "missing tracking"}), 400
 
@@ -138,33 +116,68 @@ def order_by_tracking():
         })
 
     tried = []
-    # Tenta listas com status comuns e sem filtro
-    statuses = ["1", "3", "7", "16", "18", None]
-    for st in statuses:
-        url = f"{API_URL}/order?limit=100&complete=1"
-        if st:
-            url += f"&status={st}"
+
+    def _scan_list(url):
         tried.append(url)
-
-        try:
-            r = requests.get(url, headers=HEADERS, timeout=30)
-        except Exception:
-            continue
-
+        r = requests.get(url, headers=HEADERS, timeout=30)
         if not r.ok:
-            continue
-
+            return None
         data = r.json().get("data", []) or []
         for o in data:
             ship, trk = _extract_shipping_and_tracking(o)
-            if (trk or "").upper() == tracking:
-                return _ok_json({
-                    "debug": {"tried": tried} if debug else None,
-                    "order_id": str(o.get("id")),
+            t = (trk or "").upper()
+            if t == tracking:
+                return {
+                    "order_id": str(o.get("id")) if o.get("id") is not None else None,
                     "shipping_total": ship,
-                    "tracking": trk,
-                })
+                    "tracking": trk or tracking
+                }
+        return None
 
+    # 1) tentativas diretas por tracking/search
+    for q in [
+        f"{API_URL}/order?limit=100&complete=1&tracking={tracking}",
+        f"{API_URL}/order?limit=100&complete=1&search={tracking}",
+    ]:
+        try:
+            r = requests.get(q, headers=HEADERS, timeout=30)
+            tried.append(q)
+            if r.ok:
+                data = r.json().get("data", []) or []
+                for o in data:
+                    ship, trk = _extract_shipping_and_tracking(o)
+                    t = (trk or "").upper()
+                    # alguns retornam via 'search' sem o campo de frete completo; ainda assim pegue o id
+                    if tracking in [t, str(o.get("rastreo") or "").upper(), str(o.get("rastreio") or "").upper()]:
+                        # sucesso, mesmo que shipping seja 0 -> retorna 200 (assim já preenche ID)
+                        return _ok_json({
+                            "debug": {"tried": tried} if debug else None,
+                            "order_id": str(o.get("id")) if o.get("id") is not None else None,
+                            "shipping_total": ship,
+                            "tracking": trk or tracking
+                        })
+        except Exception:
+            pass
+
+    # 2) varre diversos status e várias páginas
+    statuses = [None] + [str(i) for i in range(1, 19)]  # 1..18 + sem status
+    pages = range(1, 6)  # varre até 5 páginas
+    for st in statuses:
+        for page in pages:
+            url = f"{API_URL}/order?limit=100&complete=1&page={page}"
+            if st:
+                url += f"&status={st}"
+            try:
+                res = _scan_list(url)
+                if res:
+                    return _ok_json({
+                        "debug": {"tried": tried} if debug else None,
+                        **res
+                    })
+            except Exception:
+                continue
+
+    # não achou
     return _ok_json({
         "debug": {"tried": tried} if debug else None,
         "order_id": None,
@@ -172,13 +185,12 @@ def order_by_tracking():
         "tracking": None
     }), 404
 
-# Alias: /api/wbuy/tracking/<code>
 @app.route("/api/wbuy/tracking/<code>")
 def order_by_tracking_alias(code):
     with app.test_request_context(f"/api/wbuy/order?tracking={code}"):
         return order_by_tracking()
 
-# ========== OUTRAS ROTAS QUE VOCÊ JÁ USAVA ==========
+# ----------- OUTRAS ROTAS QUE VOCÊ JÁ USA ------------
 @app.route("/")
 def home():
     return "API da Martier rodando com rotas WBuy + auxiliares"
@@ -210,7 +222,6 @@ def concluir_pedido():
         r = requests.put(url, json=payload, headers=HEADERS, timeout=30)
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
-
     if r.status_code in (200, 201, 202, 204):
         return jsonify({"success": True})
     return make_response(r.text, r.status_code)
@@ -257,6 +268,5 @@ def buscar_observacoes(pedido_id):
     except Exception as e:
         return jsonify({"erro": str(e)}), 500
 
-# =====================================================
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
