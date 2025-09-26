@@ -9,7 +9,7 @@ load_dotenv()
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=False)
 
-# ===== WBuy config =====
+# ========= WBuy =========
 API_URL   = os.getenv("WBUY_BASE_URL", "https://sistema.sistemawbuy.com.br/api/v1").rstrip("/")
 TOKEN     = os.getenv("WBUY_TOKEN", "")
 TIMEOUT_S = 30
@@ -19,11 +19,12 @@ session.headers.update({
     "Authorization": f"Bearer {TOKEN}",
     "Accept": "application/json",
     "Content-Type": "application/json",
-    "User-Agent": "Martier-API/1.1"
+    "User-Agent": "Martier-API/1.2"
 })
 
 def _safe_float(x, default=0.0):
     try:
+        # aceita "21,74" e "21.74" e "21.740,00" (remove milhares)
         return float(str(x).replace(".", "").replace(",", "."))
     except Exception:
         try:
@@ -40,24 +41,18 @@ def _first_nonempty(*vals):
         return v
     return None
 
-# ---------- procura recursiva por "frete"/"shipping" ----------
+# ---- varredura recursiva por chaves de frete/shipping ----
 def _scan_for_shipping(obj, path="$", matches=None):
-    """
-    Varre o JSON e coleta (path, value) onde a chave sugere frete.
-    """
     if matches is None:
         matches = []
-
     key_hits = {"frete", "valor_frete", "frete_total", "total_frete",
-                "shipping", "shipping_total", "valor_entrega",
-                "valorenvio", "valor_envio", "entrega", "delivery"}
-
+                "shipping", "shipping_total", "valor_envio", "valorenvio",
+                "entrega", "delivery"}
     try:
         if isinstance(obj, dict):
             for k, v in obj.items():
                 p = f"{path}.{k}"
                 kn = str(k).lower().replace("-", "_")
-                # se a chave indica frete, guarda o valor
                 if any(tag in kn for tag in key_hits):
                     matches.append((p, v))
                 _scan_for_shipping(v, p, matches)
@@ -69,20 +64,16 @@ def _scan_for_shipping(obj, path="$", matches=None):
     return matches
 
 def _extract_shipping_from_payload(payload, debug=False):
-    """
-    Tenta extrair o frete de vários formatos possíveis.
-    Retorna (valor, detalhes_debug)
-    """
     dbg = {"tried": [], "matches": []}
 
-    # 1) normaliza "data"
+    # normaliza "data"
     data = payload.get("data", payload)
     if isinstance(data, list) and data:
         data = data[0]
     if not isinstance(data, dict):
         data = {}
 
-    # 2) palpites diretos
+    # palpites diretos mais comuns em wBuy
     candidates = [
         data.get("shipping_total"),
         data.get("valor_frete"),
@@ -91,11 +82,11 @@ def _extract_shipping_from_payload(payload, debug=False):
         data.get("total_frete"),
         (data.get("totals") or {}).get("shipping") if isinstance(data.get("totals"), dict) else None,
         (data.get("totais") or {}).get("frete") if isinstance(data.get("totais"), dict) else None,
+        (data.get("resumo") or {}).get("frete") if isinstance(data.get("resumo"), dict) else None,
         (data.get("shipping") or {}).get("total") if isinstance(data.get("shipping"), dict) else None,
         (data.get("order") or {}).get("shipping", {}).get("total") if isinstance(data.get("order"), dict) else None,
         (data.get("pagamento") or {}).get("frete") if isinstance(data.get("pagamento"), dict) else None,
         (data.get("financeiro") or {}).get("frete") if isinstance(data.get("financeiro"), dict) else None,
-        (data.get("resumo") or {}).get("frete") if isinstance(data.get("resumo"), dict) else None,
     ]
     dbg["tried"] = [str(c) for c in candidates]
 
@@ -104,9 +95,9 @@ def _extract_shipping_from_payload(payload, debug=False):
         if val is not None:
             return (val, dbg) if debug else (val, None)
 
-    # 3) varredura recursiva por nomes de chave "frete/shipping"
+    # varredura completa por nomes de chave
     matches = _scan_for_shipping(data)
-    dbg["matches"] = [{"path": p, "value": v} for p, v in matches[:50]]  # limita debug
+    dbg["matches"] = [{"path": p, "value": v} for p, v in matches[:50]]
     for _, v in matches:
         val = _safe_float(v, None)
         if val is not None:
@@ -114,7 +105,7 @@ def _extract_shipping_from_payload(payload, debug=False):
 
     return (0.0, dbg) if debug else (0.0, None)
 
-def normalize_order_json(payload, debug=False):
+def _normalize_order(payload, debug=False):
     data = payload.get("data", payload)
     if isinstance(data, list) and data:
         data = data[0]
@@ -124,35 +115,25 @@ def normalize_order_json(payload, debug=False):
     order_id = _first_nonempty(
         data.get("id"), data.get("order_id"), data.get("pedido_id"), data.get("numero_pedido")
     )
-
     tracking = _first_nonempty(
-        data.get("tracking"),
-        data.get("codigo_rastreio"),
-        data.get("codigo_rastreamento"),
-        data.get("rastreio"),
-        data.get("rastreio_codigo"),
+        data.get("tracking"), data.get("codigo_rastreio"), data.get("codigo_rastreamento"),
+        data.get("rastreio"), data.get("rastreio_codigo")
     )
     if not tracking:
-        rastreios = data.get("rastreios") or data.get("trackings")
-        if isinstance(rastreios, list) and rastreios:
-            for r in rastreios:
+        arr = data.get("rastreios") or data.get("trackings")
+        if isinstance(arr, list):
+            for r in arr:
                 cand = r.get("codigo") if isinstance(r, dict) else r
-                if cand:
-                    tracking = str(cand)
-                    break
+                if cand: tracking = str(cand); break
 
     shipping_total, dbg = _extract_shipping_from_payload(payload, debug=debug)
-
-    out = {
-        "order_id": str(order_id) if order_id is not None else None,
-        "tracking": tracking,
-        "shipping_total": shipping_total,
-    }
-    if debug and dbg:
-        out["debug"] = dbg
+    out = {"order_id": str(order_id) if order_id is not None else None,
+           "tracking": tracking,
+           "shipping_total": shipping_total}
+    if debug: out["debug"] = dbg
     return out
 
-# ================== rotas existentes ==================
+# ========= suas rotas existentes =========
 @app.route("/")
 def home():
     return "API da Martier rodando com todas as rotas!"
@@ -205,7 +186,7 @@ def importar_produtos():
             return make_response(r.text, r.status_code)
         data = r.json()
         produtos_raw = data.get("data", []) or []
-        produtos_filtrados = []
+        resp = []
         for produto in produtos_raw:
             nome = produto.get("produto", "sem nome")
             estoque = produto.get("estoque", []) or []
@@ -215,12 +196,8 @@ def importar_produtos():
                 variacoes = variacao.get("variacao", {}) or {}
                 if variacoes.get("nome") == "Tamanho":
                     tamanho = variacoes.get("valor", "sem tamanho")
-                produtos_filtrados.append({
-                    "produto": nome,
-                    "erp_id": erp_id,
-                    "tamanho": tamanho
-                })
-        return jsonify(produtos_filtrados)
+                resp.append({"produto": nome, "erp_id": erp_id, "tamanho": tamanho})
+        return jsonify(resp)
     except Exception as e:
         return jsonify({"erro": str(e)}), 500
 
@@ -242,61 +219,31 @@ def buscar_observacoes(pedido_id):
     except Exception as e:
         return jsonify({"erro": str(e)}), 500
 
-# ================== novas rotas (proxy WBuy) ==================
+# ========= novas rotas (proxy WBuy) =========
 @app.get("/api/wbuy/order/<order_id>")
 def wbuy_by_order(order_id):
     """
-    Busca pedido por ID (ou numero_pedido) e extrai valor do frete.
+    Busca somente por /order/{id} e extrai frete do JSON.
     Use ?debug=1 para ver caminhos encontrados.
     """
     debug = request.args.get("debug") is not None
     try:
-        # 1) /order/{id}?complete=1
-        url1 = f"{API_URL}/order/{order_id}?complete=1"
-        r = session.get(url1, timeout=TIMEOUT_S)
-        if r.ok:
-            payload = r.json()
-            out = normalize_order_json(payload, debug=debug)
-            # se ainda for 0, tenta fallback por numero_pedido
-            if out.get("shipping_total", 0) > 0 or not out.get("order_id"):
-                return jsonify(out)
-
-        # 2) fallback: /order?numero_pedido=...&complete=1
-        url2 = f"{API_URL}/order?numero_pedido={order_id}&limit=1&complete=1"
-        r2 = session.get(url2, timeout=TIMEOUT_S)
-        if not r2.ok:
-            return make_response(r2.text, r2.status_code)
-        payload2 = r2.json()
-        out2 = normalize_order_json(payload2, debug=debug)
-        return jsonify(out2)
+        url = f"{API_URL}/order/{order_id}"
+        r = session.get(url, timeout=TIMEOUT_S)
+        if not r.ok:
+            return make_response(r.text, r.status_code)
+        payload = r.json()
+        out = _normalize_order(payload, debug=debug)
+        return jsonify(out)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 @app.get("/api/wbuy/tracking/<tracking_code>")
 def wbuy_by_tracking(tracking_code):
-    """
-    Tenta localizar um pedido pelo código de rastreio.
-    Nem todos os ambientes WBuy filtram por tracking; aqui existe varredura
-    de algumas páginas recentes como fallback.
-    """
-    # 1) tentativas com query param
-    for p in ["tracking", "rastreio", "codigo_rastreio", "codigo_rastreamento"]:
-        try:
-            url = f"{API_URL}/order?{p}={tracking_code}&limit=100&complete=1"
-            r = session.get(url, timeout=TIMEOUT_S)
-            if r.ok:
-                data = r.json().get("data")
-                if isinstance(data, list) and data:
-                    return jsonify(normalize_order_json({"data": data[0]}))
-                if isinstance(data, dict) and data:
-                    return jsonify(normalize_order_json({"data": data}))
-        except Exception:
-            pass
-
-    # 2) fallback: varre algumas páginas recentes
+    # algumas instâncias não filtram por tracking; mantemos varredura de páginas recentes
     try:
-        for page in range(1, 4):  # até 300 pedidos recentes
-            url = f"{API_URL}/order?limit=100&page={page}&complete=1"
+        for page in range(1, 4):
+            url = f"{API_URL}/order?limit=100&page={page}"
             r = session.get(url, timeout=TIMEOUT_S)
             if not r.ok:
                 break
@@ -309,12 +256,11 @@ def wbuy_by_tracking(tracking_code):
                     item.get("rastreio"),
                 )
                 if cand and str(cand).strip().upper() == tracking_code.strip().upper():
-                    return jsonify(normalize_order_json({"data": item}))
+                    return jsonify(_normalize_order({"data": item}))
     except Exception:
         pass
-
     return jsonify({"error": "order_not_found"}), 404
 
-# ================== run ==================
+# ========= run =========
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
