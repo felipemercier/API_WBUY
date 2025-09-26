@@ -7,7 +7,6 @@ from dotenv import load_dotenv
 load_dotenv()
 
 app = Flask(__name__)
-# CORS aberto para facilitar o front (ajuste o origin se quiser restringir)
 CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=False)
 
 # ========= WBuy =========
@@ -20,17 +19,53 @@ session.headers.update({
     "Authorization": f"Bearer {TOKEN}",
     "Accept": "application/json",
     "Content-Type": "application/json",
-    "User-Agent": "Martier-API/1.3"
+    "User-Agent": "Martier-API/1.4"
 })
 
 # ========= Helpers =========
-def _safe_float(x, default=0.0):
-    """Converte '21,74' / '21.74' / '1.234,56' em float."""
-    try:
-        return float(str(x).replace(".", "").replace(",", "."))
-    except Exception:
+def _smart_float(x, default=0.0):
+    """
+    Converte strings com formatos BR/US para float:
+      - '1.234,56' -> 1234.56
+      - '21,74'    -> 21.74
+      - '21.74'    -> 21.74
+      - 21.74      -> 21.74
+    """
+    if x is None:
+        return default
+    if isinstance(x, (int, float)):
         try:
-            return float(str(x))
+            return float(x)
+        except Exception:
+            return default
+
+    s = str(x).strip()
+    if not s or s.lower() == "none":
+        return default
+
+    has_comma = "," in s
+    has_dot   = "." in s
+
+    try:
+        if has_comma and has_dot:
+            # Decide pelo último separador como decimal
+            if s.rfind(",") > s.rfind("."):
+                # BR: '.' milhar, ',' decimal
+                s = s.replace(".", "").replace(",", ".")
+            else:
+                # EN: ',' milhar, '.' decimal
+                s = s.replace(",", "")
+        elif has_comma and not has_dot:
+            # Apenas vírgula -> decimal
+            s = s.replace(",", ".")
+        else:
+            # Apenas ponto ou nenhum -> ponto decimal (remove vírgulas de milhar)
+            s = s.replace(",", "")
+        return float(s)
+    except Exception:
+        # fallback bruto
+        try:
+            return float(s)
         except Exception:
             return default
 
@@ -45,8 +80,7 @@ def _first_nonempty(*vals):
 
 def _scan_for_shipping(obj, path="$", matches=None):
     """
-    Varredura recursiva: coleta (path, value) onde as chaves sugerem 'frete'.
-    Ex.: frete, valor_frete, frete_valor, shipping_total, etc.
+    Varredura recursiva para chaves relacionadas a frete.
     """
     if matches is None:
         matches = []
@@ -54,7 +88,7 @@ def _scan_for_shipping(obj, path="$", matches=None):
     key_hits = {
         "frete", "valor_frete", "frete_total", "total_frete",
         "shipping", "shipping_total", "valor_envio", "valorenvio",
-        "entrega", "delivery", "frete_valor"  # <- importante na sua WBuy
+        "entrega", "delivery", "frete_valor"
     }
 
     try:
@@ -74,8 +108,8 @@ def _scan_for_shipping(obj, path="$", matches=None):
 
 def _extract_shipping_from_payload(payload, debug=False):
     """
-    Extrai o valor do frete de vários formatos possíveis no JSON.
-    Retorna (valor, debug_info|None).
+    Extrai valor de frete de várias estruturas possíveis.
+    Retorna (valor, dbg|None).
     """
     dbg = {"tried": [], "matches": []}
 
@@ -86,14 +120,14 @@ def _extract_shipping_from_payload(payload, debug=False):
     if not isinstance(data, dict):
         data = {}
 
-    # palpites diretos (mais comuns na sua instância)
+    # palpites diretos
     candidates = [
         data.get("shipping_total"),
         data.get("valor_frete"),
         data.get("frete_total"),
         data.get("total_frete"),
-        data.get("frete_valor"),                                 # <- direto
-        (data.get("frete") or {}).get("valor"),                  # <- frete.valor
+        data.get("frete_valor"),
+        (data.get("frete") or {}).get("valor"),
         (data.get("totals") or {}).get("shipping") if isinstance(data.get("totals"), dict) else None,
         (data.get("totais") or {}).get("frete") if isinstance(data.get("totais"), dict) else None,
         (data.get("resumo") or {}).get("frete") if isinstance(data.get("resumo"), dict) else None,
@@ -103,7 +137,7 @@ def _extract_shipping_from_payload(payload, debug=False):
         (data.get("financeiro") or {}).get("frete") if isinstance(data.get("financeiro"), dict) else None,
     ]
 
-    # produtos[] também trazem frete_valor/frete.valor às vezes
+    # produtos[] também podem ter frete
     produtos = data.get("produtos") or data.get("itens") or []
     if isinstance(produtos, list):
         for it in produtos:
@@ -114,7 +148,7 @@ def _extract_shipping_from_payload(payload, debug=False):
     dbg["tried"] = [str(c) for c in candidates]
 
     for c in candidates:
-        val = _safe_float(c, None)
+        val = _smart_float(c, None)
         if val is not None:
             return (val, dbg) if debug else (val, None)
 
@@ -123,15 +157,13 @@ def _extract_shipping_from_payload(payload, debug=False):
     dbg["matches"] = [{"path": p, "value": v} for p, v in matches[:100]]
 
     for _, v in matches:
-        # se o match for dict (ex.: {"valor":"21,74"}), tenta campos comuns:
         if isinstance(v, dict):
             for k in ("valor", "total", "valor_total"):
                 if k in v:
-                    val = _safe_float(v[k], None)
+                    val = _smart_float(v[k], None)
                     if val is not None:
                         return (val, dbg) if debug else (val, None)
-        # se for escalar (string/num), tenta direto
-        val = _safe_float(v, None)
+        val = _smart_float(v, None)
         if val is not None:
             return (val, dbg) if debug else (val, None)
 
@@ -276,8 +308,8 @@ def buscar_observacoes(pedido_id):
 @app.get("/api/wbuy/order/<order_id>")
 def wbuy_by_order(order_id):
     """
-    Busca somente por /order/{id} e extrai o frete do JSON.
-    Use ?debug=1 para ver caminhos encontrados.
+    Busca /order/{id} e extrai o frete do JSON.
+    Use ?debug=1 para ver caminhos analisados.
     """
     debug = request.args.get("debug") is not None
     try:
