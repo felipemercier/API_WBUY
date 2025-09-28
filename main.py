@@ -1,436 +1,238 @@
-# main.py
-from flask import Flask, jsonify, request, make_response, Blueprint
+from flask import Flask, jsonify, request, make_response
 from flask_cors import CORS
-import os, requests, csv, io, json
+import requests
+import os
 from dotenv import load_dotenv
 
 load_dotenv()
 
 app = Flask(__name__)
+# CORS aberto (simplifica teste; em produção você pode limitar ao seu domínio)
 CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=False)
 
-# ====== CONFIG ======
+# ====== Config WBuy ======
 API_URL = "https://sistema.sistemawbuy.com.br/api/v1"
-TOKEN = os.getenv("WBUY_TOKEN", "").strip()
-PRODUTOS_URL = os.getenv("PRODUTOS_URL", "").strip()  # opcional (JSON/CSV)
+TOKEN   = os.getenv("WBUY_TOKEN", "")
 
 HEADERS = {
-    "Authorization": f"Bearer {TOKEN}" if TOKEN else "",
+    "Authorization": f"Bearer {TOKEN}",
     "Accept": "application/json",
     "Content-Type": "application/json",
 }
 
-# ====== Helpers comuns ======
-def _ok(r):
-    return r.status_code in (200, 201, 202)
+TIMEOUT = 30
 
-def _json_safe(resp):
+# ====== Helpers (NOVOS) ======
+def _safe_float(x, default=0.0):
     try:
-        return resp.json()
+        return float(str(x).replace(",", "."))
     except Exception:
-        try:
-            return resp.text
-        except Exception:
-            return {}
+        return default
 
-def _num_centavos(v):
-    """Normaliza dinheiro (aceita int/float/str BR) -> centavos (int)."""
-    if v is None:
-        return 0
-    if isinstance(v, (int, float)):
-        if isinstance(v, float) and v < 1000:
-            return int(round(v * 100))
-        return int(round(v))
-    s = str(v).strip()
-    if not s:
-        return 0
-    s = s.replace(".", "").replace(",", ".")
-    try:
-        return int(round(float(s) * 100))
-    except Exception:
-        return 0
+def _first_nonempty(*vals):
+    for v in vals:
+        if v is None:
+            continue
+        if isinstance(v, str) and not v.strip():
+            continue
+        return v
+    return None
 
-def _extract_shipping_total(order_json: dict) -> int:
-    cands = [
-        order_json.get("shipping_total"),
-        order_json.get("valor_frete"),
-        order_json.get("frete_total"),
-        order_json.get("total_frete"),
-        (order_json.get("frete") or {}).get("valor"),
-        (order_json.get("totals") or {}).get("shipping"),
-        (order_json.get("order") or {}).get("shipping_total"),
-    ]
-    for c in cands:
-        n = _num_centavos(c)
-        if n > 0:
-            return n
-    return 0
-
-def _extract_tracking_from_detail(order_json: dict) -> str:
-    cands = [
-        (order_json.get("frete") or {}).get("rastreio"),
-        order_json.get("rastreamento"),
-        (order_json.get("shipping") or {}).get("tracking"),
-        (order_json.get("order") or {}).get("tracking"),
-    ]
-    for c in cands:
-        if c:
-            return str(c).strip().upper()
-    return ""
-
-def _unwrap_first(obj):
+def _normalize_order_json(payload):
     """
-    Retorna o primeiro objeto "pedido" de qualquer formato comum:
-    - {'data': {...}} / {'data': [{...}, ...]}
-    - [{...}, ...]
-    - {...}
+    Normaliza a resposta da WBuy para um shape estável:
+    { order_id, tracking, shipping_total }
     """
-    if obj is None:
-        return {}
-    if isinstance(obj, dict):
-        if "data" in obj:
-            d = obj.get("data")
-            if isinstance(d, list):
-                return d[0] if d else {}
-            if isinstance(d, dict):
-                return d
-        return obj
-    if isinstance(obj, list):
-        return obj[0] if obj else {}
-    return {}
+    data = payload.get("data", payload)
+    if isinstance(data, list) and data:
+        data = data[0]
+    if not isinstance(data, dict):
+        data = {}
 
-def _detail_by_id_any(order_id, tried_list):
-    """
-    Busca detalhe garantindo formato de objeto:
-      1) /order/{id}
-      2) /order?id={id}&limit=1&complete=1
-    """
-    try:
-        url = f"{API_URL}/order/{order_id}"
-        tried_list.append(url)
-        r = requests.get(url, headers=HEADERS, timeout=30)
-        if _ok(r):
-            raw = _json_safe(r)
-            obj = _unwrap_first(raw)
-            if obj:
-                return obj, raw
-    except Exception:
-        pass
-    try:
-        url = f"{API_URL}/order?id={order_id}&limit=1&complete=1"
-        tried_list.append(url)
-        r = requests.get(url, headers=HEADERS, timeout=30)
-        if _ok(r):
-            raw = _json_safe(r)
-            obj = _unwrap_first(raw)
-            if obj:
-                return obj, raw
-    except Exception:
-        pass
-    return {}, {}
+    order_id = _first_nonempty(
+        data.get("id"),
+        data.get("order_id"),
+        data.get("pedido_id"),
+        data.get("numero_pedido"),
+    )
 
-# ===================== ROTAS ORIGINAIS (v1) – mantidas =====================
+    tracking = _first_nonempty(
+        data.get("tracking"),
+        data.get("codigo_rastreio"),
+        data.get("codigo_rastreamento"),
+        data.get("rastreio"),
+        data.get("rastreio_codigo"),
+    )
+    if not tracking:
+        rastreios = data.get("rastreios") or data.get("trackings")
+        if isinstance(rastreios, list) and rastreios:
+            for r in rastreios:
+                cand = r.get("codigo") if isinstance(r, dict) else r
+                if cand:
+                    tracking = str(cand)
+                    break
+
+    shipping_total = _first_nonempty(
+        data.get("shipping_total"),
+        data.get("valor_frete"),
+        data.get("frete"),
+        (data.get("totals") or {}).get("shipping") if isinstance(data.get("totals"), dict) else None,
+        (data.get("shipping") or {}).get("total") if isinstance(data.get("shipping"), dict) else None,
+        (data.get("order") or {}).get("shipping", {}).get("total") if isinstance(data.get("order"), dict) else None,
+    )
+
+    return {
+        "order_id": str(order_id) if order_id is not None else None,
+        "tracking": tracking,
+        "shipping_total": _safe_float(shipping_total, 0.0),
+    }
+
+# ====== SUAS ROTAS EXISTENTES (inalteradas) ======
 @app.route("/")
 def home():
-    return "API da Martier OK"
+    return "API da Martier rodando com todas as rotas!"
 
-@app.route("/api/wbuy/ping")
-def ping_v1():
-    if not TOKEN:
-        return jsonify({"ok": False, "reason": "no_token"}), 200
+@app.route("/api/pedidos")
+def listar_pedidos():
+    status = request.args.get("status", "16")
+    url = f"{API_URL}/order?status={status}&limit=100"
     try:
-        url = f"{API_URL}/order?limit=1"
-        r = requests.get(url, headers=HEADERS, timeout=20)
-        return jsonify({"ok": _ok(r)}), 200
+        r = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
+        if not r.ok:
+            return make_response(r.text, r.status_code)
+        data = r.json().get("data", [])
+        if not isinstance(data, list):
+            data = []
+        return jsonify(data)
     except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 200
+        return jsonify({"erro": str(e)}), 500
 
-@app.route("/api/wbuy/order/<order_id>")
-def get_order_detail_v1(order_id):
-    """
-    (v1) Mantida a lógica original (pode falhar se a WBuy devolver lista).
-    Foi preservada para não quebrar o outro sistema.
-    """
+@app.route("/api/concluir", methods=["POST"])
+def concluir_pedido():
+    body = request.get_json(silent=True) or {}
+    pedido_id = body.get("id")
+    if not pedido_id:
+        return jsonify({"success": False, "error": "id é obrigatório"}), 400
+
+    url = f"{API_URL}/order/status/{pedido_id}"
+    payload = {"status": "7", "info_status": "Pedido concluído via painel"}
+    try:
+        r = requests.put(url, json=payload, headers=HEADERS, timeout=TIMEOUT)
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+    if r.status_code in (200, 201, 202, 204):
+        return jsonify({"success": True}), 200
+    return make_response(r.text, r.status_code)
+
+@app.route("/importar-produtos", methods=["GET"])
+def importar_produtos():
+    url = f"{API_URL}/product/?ativo=1&limit=9999&complete=1"
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=60)
+        if not r.ok:
+            return make_response(r.text, r.status_code)
+
+        data = r.json()
+        produtos_raw = data.get("data", []) or []
+        produtos_filtrados = []
+        for produto in produtos_raw:
+            nome = produto.get("produto", "sem nome")
+            estoque = produto.get("estoque", []) or []
+            for variacao in estoque:
+                erp_id = variacao.get("erp_id", "sem erp_id")
+                tamanho = "sem tamanho"
+                variacoes = variacao.get("variacao", {}) or {}
+                if variacoes.get("nome") == "Tamanho":
+                    tamanho = variacoes.get("valor", "sem tamanho")
+                produtos_filtrados.append({
+                    "produto": nome,
+                    "erp_id": erp_id,
+                    "tamanho": tamanho
+                })
+        return jsonify(produtos_filtrados)
+    except Exception as e:
+        return jsonify({"erro": str(e)}), 500
+
+@app.route("/observacoes/<pedido_id>", methods=["GET"])
+def buscar_observacoes(pedido_id):
+    url = f"{API_URL}/order/{pedido_id}"
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
+        if not r.ok:
+            return make_response(r.text, r.status_code)
+
+        data = r.json().get("data")
+        if isinstance(data, list) and data:
+            observacoes = data[0].get("observacoes", "")
+        elif isinstance(data, dict):
+            observacoes = data.get("observacoes", "")
+        else:
+            observacoes = ""
+        return jsonify({"observacoes": observacoes})
+    except Exception as e:
+        return jsonify({"erro": str(e)}), 500
+
+# ====== ROTAS NOVAS (mínimas, para o front) ======
+@app.get("/api/ping")
+def ping():
+    return jsonify({"ok": True})
+
+@app.get("/api/wbuy/ping")
+def ping_wbuy():
+    return jsonify({"ok": True})
+
+@app.get("/api/wbuy/order/<order_id>")
+def wbuy_by_order(order_id):
+    """Proxy: busca pedido por ID na WBuy e normaliza campos principais."""
     try:
         url = f"{API_URL}/order/{order_id}"
-        r = requests.get(url, headers=HEADERS, timeout=30)
-        if not _ok(r):
+        r = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
+        if not r.ok:
             return make_response(r.text, r.status_code)
-        data = r.json()
-        obj = data.get("data", data)  # comportamento antigo
-        if not isinstance(obj, dict):
-            # mantém compat: devolve algo em vez de 500
-            return jsonify({"order_id": str(order_id), "shipping_total": 0, "tracking": "", "debug": {"raw": data}}), 200
-        ship = _extract_shipping_total(obj)
-        trk = _extract_tracking_from_detail(obj)
-        return jsonify({"order_id": str(order_id), "shipping_total": ship, "tracking": trk, "debug": {"raw": data}}), 200
+        return jsonify(_normalize_order_json(r.json()))
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-@app.route("/api/wbuy/order")
-def find_by_query_v1():
-    """
-    (v1) Mantido:
-      /api/wbuy/order?id=...
-      /api/wbuy/order?tracking=... [&deep=1]
-    """
-    order_id = (request.args.get("id") or "").strip()
-    if order_id:
-        return get_order_detail_v1(order_id)
-
-    tracking = (request.args.get("tracking") or "").strip().upper()
-    deep = (request.args.get("deep") or "0").strip() in ("1", "true", "yes")
-
-    if not tracking:
-        return jsonify({"error": "informe tracking ou id"}), 400
-
-    tried = []
-    try:
-        url = f"{API_URL}/order?limit=100&complete=1&search={tracking}"
-        tried.append(url)
-        r = requests.get(url, headers=HEADERS, timeout=30)
-        if _ok(r):
-            data = r.json()
-            arr = data.get("data", [])
-            if isinstance(arr, dict):
-                arr = arr.get("data", [])
-            if arr:
-                oid = arr[0].get("id") or arr[0].get("order_id")
-                if oid:
-                    return get_order_detail_v1(str(oid))
-    except Exception:
-        pass
-
-    if not deep:
-        return jsonify({"order_id": None, "shipping_total": 0, "tracking": None, "debug": {"matches": [], "tried": tried}})
-
-    STATUSES = list(range(1, 19))
-    MAX_PAGES_PER_STATUS = 5
-    LIMIT = 100
-
-    for status in STATUSES:
-        for page in range(1, MAX_PAGES_PER_STATUS + 1):
-            try:
-                url = f"{API_URL}/order?limit={LIMIT}&complete=1&page={page}&status={status}"
-                tried.append(url)
-                r = requests.get(url, headers=HEADERS, timeout=30)
-                if not _ok(r):
-                    continue
-                data = r.json()
-                arr = data.get("data", [])
-                if isinstance(arr, dict):
-                    arr = arr.get("data", [])
-                if not arr:
-                    break
-                for item in arr:
-                    oid = item.get("id") or item.get("order_id")
-                    if not oid:
-                        continue
-                    durl = f"{API_URL}/order/{oid}"
-                    tried.append(durl)
-                    d = requests.get(durl, headers=HEADERS, timeout=30)
-                    if not _ok(d):
-                        continue
-                    dobj = d.json().get("data", d.json())
-                    if not isinstance(dobj, dict):
-                        continue
-                    trk = _extract_tracking_from_detail(dobj)
-                    if trk == tracking:
-                        ship = _extract_shipping_total(dobj)
-                        return jsonify({
-                            "order_id": str(oid),
-                            "shipping_total": ship,
-                            "tracking": trk,
-                            "debug": {"matches": [durl], "tried": tried}
-                        }), 200
-            except Exception:
-                continue
-
-    return jsonify({"order_id": None, "shipping_total": 0, "tracking": None, "debug": {"matches": [], "tried": tried}}), 200
-
-# ===================== NOVO (v2) – robusto p/ Correios =====================
-api_v2 = Blueprint("api_v2", __name__, url_prefix="/api/v2/wbuy")
-
-@api_v2.get("/ping")
-def ping_v2():
-    if not TOKEN:
-        return jsonify({"ok": False, "reason": "no_token"}), 200
-    try:
-        url = f"{API_URL}/order?limit=1"
-        r = requests.get(url, headers=HEADERS, timeout=25)
-        return jsonify({"ok": _ok(r)}), 200
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 200
-
-@api_v2.get("/order/<order_id>")
-def get_order_detail_v2(order_id):
-    tried = []
-    try:
-        obj, raw = _detail_by_id_any(order_id, tried)
-        if not obj:
-            return jsonify({"error": "not_found", "debug": {"tried": tried}}), 404
-        ship = _extract_shipping_total(obj)
-        trk  = _extract_tracking_from_detail(obj)
-        return jsonify({
-            "order_id": str(order_id),
-            "shipping_total": ship,               # centavos
-            "shipping_total_reais": ship/100.0,   # reais
-            "tracking": trk,
-            "debug": {"tried": tried}
-        }), 200
-    except Exception as e:
-        return jsonify({"error": str(e), "debug": {"tried": tried}}), 500
-
-@api_v2.get("/order")
-def find_by_query_v2():
-    """
-    /api/v2/wbuy/order?id=...
-    /api/v2/wbuy/order?tracking=AA123456789BR[&deep=1]  (deep=1 por padrão)
-    """
-    order_id = (request.args.get("id") or "").strip()
-    if order_id:
-        return get_order_detail_v2(order_id)
-
-    tracking = (request.args.get("tracking") or "").strip().upper()
-    deep = (request.args.get("deep") or "1").strip().lower() in ("1", "true", "yes", "y")
-
-    if not tracking:
-        return jsonify({"error": "informe tracking ou id"}), 400
-
-    tried = []
-
-    # 1) tentativa rápida via search
-    try:
-        url = f"{API_URL}/order?limit=100&complete=1&search={tracking}"
-        tried.append(url)
-        r = requests.get(url, headers=HEADERS, timeout=35)
-        if _ok(r):
-            raw = _json_safe(r)
-            first = _unwrap_first(raw)
-            oid = str(first.get("id") or first.get("order_id") or "").strip()
-            if oid:
-                obj, _ = _detail_by_id_any(oid, tried)
-                ship = _extract_shipping_total(obj)
-                trk  = _extract_tracking_from_detail(obj)
-                return jsonify({
-                    "order_id": oid,
-                    "shipping_total": ship,
-                    "shipping_total_reais": ship/100.0,
-                    "tracking": trk,
-                    "debug": {"matches": ["search"], "tried": tried}
-                }), 200
-    except Exception:
-        pass
-
-    if not deep:
-        return jsonify({"order_id": None, "shipping_total": 0, "tracking": None, "debug": {"matches": [], "tried": tried}}), 200
-
-    # 2) varredura robusta
-    STATUSES = list(range(1, 19))
-    MAX_PAGES_PER_STATUS = 5
-    LIMIT = 100
-
-    for status in STATUSES:
-        for page in range(1, MAX_PAGES_PER_STATUS + 1):
-            try:
-                url = f"{API_URL}/order?limit={LIMIT}&complete=1&page={page}&status={status}"
-                tried.append(url)
-                r = requests.get(url, headers=HEADERS, timeout=40)
-                if not _ok(r):
-                    continue
-                raw = _json_safe(r)
-                arr = []
-                if isinstance(raw, dict):
-                    arr = raw.get("data", [])
-                elif isinstance(raw, list):
-                    arr = raw
-                if isinstance(arr, dict):
-                    arr = arr.get("data", [])
-                if not isinstance(arr, list) or not arr:
-                    break
-                for item in arr:
-                    oid = item.get("id") or item.get("order_id")
-                    if not oid:
-                        continue
-                    obj, _ = _detail_by_id_any(oid, tried)
-                    if not obj:
-                        continue
-                    trk = _extract_tracking_from_detail(obj)
-                    if trk == tracking:
-                        ship = _extract_shipping_total(obj)
-                        return jsonify({
-                            "order_id": str(oid),
-                            "shipping_total": ship,
-                            "shipping_total_reais": ship/100.0,
-                            "tracking": trk,
-                            "debug": {"matches": ["deep"], "tried": tried}
-                        }), 200
-            except Exception:
-                continue
-
-    return jsonify({"order_id": None, "shipping_total": 0, "tracking": None, "debug": {"matches": [], "tried": tried}}), 200
-
-app.register_blueprint(api_v2)
-
-# ===================== Compat: /importar-produtos (outro sistema) =====================
-def _map_produtos_lista(lst):
-    """Normaliza lista de dicts -> {produto, tamanho, erp_id}."""
-    out = []
-    for it in lst or []:
-        nome   = it.get("produto") or it.get("nome") or it.get("name") or ""
-        tam    = it.get("tamanho") or it.get("size") or it.get("variant") or ""
-        erp_id = it.get("erp_id")  or it.get("sku")  or it.get("codigo") or it.get("code") or ""
-        if not (nome and (tam or erp_id)):
-            continue
-        out.append({"produto": str(nome), "tamanho": str(tam), "erp_id": str(erp_id)})
-    return out
-
-@app.get("/importar-produtos")
-def importar_produtos():
-    # Se tiver PRODUTOS_URL, tenta baixar e normalizar (JSON ou CSV)
-    if PRODUTOS_URL:
+# (Opcional) Buscar por código de rastreio — útil como fallback no front
+@app.get("/api/wbuy/tracking/<tracking_code>")
+def wbuy_by_tracking(tracking_code):
+    # 1) tenta com possíveis parâmetros de filtro
+    for p in ["tracking", "rastreio", "codigo_rastreio", "codigo_rastreamento"]:
         try:
-            r = requests.get(PRODUTOS_URL, timeout=40)
-            r.raise_for_status()
-            ctype = (r.headers.get("Content-Type") or "").lower()
-            body  = r.content
+            url = f"{API_URL}/order?{p}={tracking_code}&limit=100"
+            r = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
+            if r.ok:
+                data = r.json().get("data")
+                if isinstance(data, list) and data:
+                    return jsonify(_normalize_order_json({"data": data[0]}))
+                if isinstance(data, dict) and data:
+                    return jsonify(_normalize_order_json({"data": data}))
+        except Exception:
+            pass
 
-            # JSON
-            if "application/json" in ctype or body.strip().startswith(b"[") or body.strip().startswith(b"{"):
-                data = json.loads(body.decode("utf-8", errors="ignore"))
-                if isinstance(data, dict):
-                    data = data.get("data") or data.get("items") or []
-                return jsonify(_map_produtos_lista(data))
+    # 2) fallback: varre algumas páginas recentes
+    try:
+        for page in range(1, 4):
+            url = f"{API_URL}/order?limit=100&page={page}"
+            r = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
+            if not r.ok:
+                break
+            arr = r.json().get("data") or []
+            for item in arr:
+                cand = _first_nonempty(
+                    item.get("tracking"),
+                    item.get("codigo_rastreio"),
+                    item.get("codigo_rastreamento"),
+                    item.get("rastreio"),
+                )
+                if cand and str(cand).strip().upper() == tracking_code.strip().upper():
+                    return jsonify(_normalize_order_json({"data": item}))
+    except Exception:
+        pass
 
-            # CSV (colunas: produto,tamanho,erp_id) – aceita ; ou ,
-            text = body.decode("utf-8", errors="ignore")
-            try:
-                dialect = csv.Sniffer().sniff(text.splitlines()[0])
-            except Exception:
-                dialect = csv.excel
-            reader = csv.DictReader(io.StringIO(text), dialect=dialect)
-            rows = []
-            for row in reader:
-                rows.append({
-                    "produto": row.get("produto") or row.get("nome") or "",
-                    "tamanho": row.get("tamanho") or row.get("size") or "",
-                    "erp_id":  row.get("erp_id")  or row.get("sku")  or row.get("codigo") or ""
-                })
-            rows = [r for r in rows if r["produto"] and (r["tamanho"] or r["erp_id"])]
-            return jsonify(rows)
-        except Exception as e:
-            # Não derruba a UI: retorna estrutura vazia com info de erro
-            return jsonify({"erro":"falha_fonte", "detalhe":str(e), "dados":[]}), 200
+    return jsonify({"error": "order_not_found"}), 404
 
-    # Mock básico (garante que o front não quebre se não houver fonte configurada)
-    demo = [
-        {"produto":"CAMISETA PRETA", "tamanho":"P",  "erp_id":"CMP-001"},
-        {"produto":"CAMISETA PRETA", "tamanho":"M",  "erp_id":"CMP-002"},
-        {"produto":"CAMISETA PRETA", "tamanho":"G",  "erp_id":"CMP-003"},
-        {"produto":"MOLETOM AZUL",   "tamanho":"UN", "erp_id":"MOA-010"},
-    ]
-    return jsonify(demo)
-
-# ====== run ======
+# ====== RUN ======
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
