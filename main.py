@@ -160,35 +160,59 @@ def concluir_pedido():
 
 @app.route("/importar-produtos", methods=["GET"])
 def importar_produtos():
-    url = f"{API_URL}/product/?ativo=1&limit=9999&complete=1"
     try:
-        r = requests.get(url, headers=HEADERS, timeout=60)
-        if not r.ok:
-            return make_response(r.text, r.status_code)
-
-        data = r.json()
-        produtos_raw = data.get("data", []) or []
         produtos_filtrados = []
 
-        for produto in produtos_raw:
-            nome = produto.get("produto", "sem nome")
+        page = 1
+        limit = 100  # a API parece limitar aqui
+        while True:
+            url = f"{API_URL}/product/?ativo=1&limit={limit}&page={page}&complete=1"
+            r = requests.get(url, headers=HEADERS, timeout=60)
+            if not r.ok:
+                return make_response(r.text, r.status_code)
 
-            estoque = produto.get("estoque", []) or []
-            if not isinstance(estoque, list):
-                estoque = []
+            data = r.json()
+            produtos_raw = data.get("data", []) or []
+            if not produtos_raw:
+                break  # acabou
 
-            for variacao in estoque:
-                if not isinstance(variacao, dict):
-                    continue
+            for produto in produtos_raw:
+                nome = produto.get("produto", "sem nome")
+                estoque = produto.get("estoque", []) or []
+                if not isinstance(estoque, list):
+                    estoque = []
 
-                erp_id = variacao.get("erp_id", "sem erp_id")
-                tamanho = _extrair_tamanho(variacao)
+                for variacao in estoque:
+                    if not isinstance(variacao, dict):
+                        continue
 
-                produtos_filtrados.append({
-                    "produto": nome,
-                    "erp_id": erp_id,
-                    "tamanho": tamanho
-                })
+                    erp_id = variacao.get("erp_id", "sem erp_id")
+
+                    # pega tamanho no formato antigo (Tamanho)
+                    tamanho = "sem tamanho"
+                    variacao_obj = variacao.get("variacao", {}) or {}
+                    if isinstance(variacao_obj, dict) and str(variacao_obj.get("nome", "")).lower() == "tamanho":
+                        tamanho = variacao_obj.get("valor", tamanho)
+
+                    # fallback: se existir campo "tamanho" direto
+                    if (tamanho == "sem tamanho") and variacao.get("tamanho"):
+                        tamanho = variacao.get("tamanho")
+
+                    produtos_filtrados.append({
+                        "produto": nome,
+                        "erp_id": erp_id,
+                        "tamanho": str(tamanho)
+                    })
+
+            # se veio menos que o limit, essa foi a última página
+            if len(produtos_raw) < limit:
+                break
+
+            page += 1
+
+            # proteção (evita loop infinito)
+            if page > 300:
+                break
 
         return jsonify(produtos_filtrados)
 
