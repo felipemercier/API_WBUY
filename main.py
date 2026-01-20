@@ -7,6 +7,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 app = Flask(__name__)
+# CORS aberto (simplifica teste; em produção você pode limitar ao seu domínio)
 CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=False)
 
 # ====== Config WBuy ======
@@ -21,8 +22,7 @@ HEADERS = {
 
 TIMEOUT = 30
 
-
-# ====== Helpers ======
+# ====== Helpers (NOVOS) ======
 def _safe_float(x, default=0.0):
     try:
         return float(str(x).replace(",", "."))
@@ -39,6 +39,10 @@ def _first_nonempty(*vals):
     return None
 
 def _normalize_order_json(payload):
+    """
+    Normaliza a resposta da WBuy para um shape estável:
+    { order_id, tracking, shipping_total }
+    """
     data = payload.get("data", payload)
     if isinstance(data, list) and data:
         data = data[0]
@@ -83,50 +87,10 @@ def _normalize_order_json(payload):
         "shipping_total": _safe_float(shipping_total, 0.0),
     }
 
-def _extrair_tamanho(variacao: dict) -> str:
-    """
-    Extrai tamanho de diferentes formatos possíveis vindos da WBuy.
-    """
-    tamanho = "sem tamanho"
-
-    # Caso 1: variacao é dict {nome:"Tamanho", valor:"P"}
-    variacao_obj = variacao.get("variacao")
-    if isinstance(variacao_obj, dict):
-        if str(variacao_obj.get("nome", "")).lower() == "tamanho":
-            tamanho = variacao_obj.get("valor", tamanho)
-
-    # Caso 2: variacoes é lista [{nome:"Tamanho", valor:"P"}, ...]
-    variacoes_list = variacao.get("variacoes")
-    if isinstance(variacoes_list, list):
-        for v in variacoes_list:
-            if isinstance(v, dict) and str(v.get("nome", "")).lower() == "tamanho":
-                tamanho = v.get("valor", tamanho)
-                break
-
-    # Caso 3: grade (algumas integrações usam grade)
-    grade = variacao.get("grade")
-    if isinstance(grade, dict):
-        tamanho = grade.get("tamanho", tamanho) or grade.get("Tamanho", tamanho) or tamanho
-
-    # Caso 4: fallback em campos comuns
-    tamanho = variacao.get("tamanho", tamanho) or tamanho
-
-    return str(tamanho)
-
-def _wbuy_get_products_page(limit: int, offset: int, complete: int = 1, ativo: int = 1):
-    """
-    Busca uma "página" via offset (WBuy não aceita page).
-    """
-    url = f"{API_URL}/product/?ativo={ativo}&limit={limit}&offset={offset}&complete={complete}"
-    r = requests.get(url, headers=HEADERS, timeout=60)
-    return r
-
-
-# ====== Rotas ======
+# ====== SUAS ROTAS EXISTENTES (inalteradas) ======
 @app.route("/")
 def home():
     return "API da Martier rodando com todas as rotas!"
-
 
 @app.route("/api/pedidos")
 def listar_pedidos():
@@ -142,7 +106,6 @@ def listar_pedidos():
         return jsonify(data)
     except Exception as e:
         return jsonify({"erro": str(e)}), 500
-
 
 @app.route("/api/concluir", methods=["POST"])
 def concluir_pedido():
@@ -162,59 +125,34 @@ def concluir_pedido():
         return jsonify({"success": True}), 200
     return make_response(r.text, r.status_code)
 
-
-# ✅ IMPORTADOR CORRIGIDO (offset)
 @app.route("/importar-produtos", methods=["GET"])
 def importar_produtos():
+    url = f"{API_URL}/product/?ativo=1&limit=9999&complete=1"
     try:
+        r = requests.get(url, headers=HEADERS, timeout=60)
+        if not r.ok:
+            return make_response(r.text, r.status_code)
+
+        data = r.json()
+        produtos_raw = data.get("data", []) or []
         produtos_filtrados = []
-
-        limit = 100
-        offset = 0
-        loops_max = 500  # proteção
-
-        for _ in range(loops_max):
-            r = _wbuy_get_products_page(limit=limit, offset=offset, complete=1, ativo=1)
-            if not r.ok:
-                return make_response(r.text, r.status_code)
-
-            data = r.json()
-            produtos_raw = data.get("data", []) or []
-
-            if not produtos_raw:
-                break  # acabou
-
-            for produto in produtos_raw:
-                nome = produto.get("produto", "sem nome")
-                estoque = produto.get("estoque", []) or []
-                if not isinstance(estoque, list):
-                    continue
-
-                for variacao in estoque:
-                    if not isinstance(variacao, dict):
-                        continue
-
-                    erp_id = variacao.get("erp_id", "sem erp_id")
-                    tamanho = _extrair_tamanho(variacao)
-
-                    produtos_filtrados.append({
-                        "produto": nome,
-                        "erp_id": erp_id,
-                        "tamanho": tamanho
-                    })
-
-            # próxima página
-            offset += limit
-
-            # se voltou menos do que limit, essa foi a última
-            if len(produtos_raw) < limit:
-                break
-
+        for produto in produtos_raw:
+            nome = produto.get("produto", "sem nome")
+            estoque = produto.get("estoque", []) or []
+            for variacao in estoque:
+                erp_id = variacao.get("erp_id", "sem erp_id")
+                tamanho = "sem tamanho"
+                variacoes = variacao.get("variacao", {}) or {}
+                if variacoes.get("nome") == "Tamanho":
+                    tamanho = variacoes.get("valor", "sem tamanho")
+                produtos_filtrados.append({
+                    "produto": nome,
+                    "erp_id": erp_id,
+                    "tamanho": tamanho
+                })
         return jsonify(produtos_filtrados)
-
     except Exception as e:
         return jsonify({"erro": str(e)}), 500
-
 
 @app.route("/observacoes/<pedido_id>", methods=["GET"])
 def buscar_observacoes(pedido_id):
@@ -235,8 +173,7 @@ def buscar_observacoes(pedido_id):
     except Exception as e:
         return jsonify({"erro": str(e)}), 500
 
-
-# ====== Rotas novas ======
+# ====== ROTAS NOVAS (mínimas, para o front) ======
 @app.get("/api/ping")
 def ping():
     return jsonify({"ok": True})
@@ -247,6 +184,7 @@ def ping_wbuy():
 
 @app.get("/api/wbuy/order/<order_id>")
 def wbuy_by_order(order_id):
+    """Proxy: busca pedido por ID na WBuy e normaliza campos principais."""
     try:
         url = f"{API_URL}/order/{order_id}"
         r = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
@@ -256,8 +194,10 @@ def wbuy_by_order(order_id):
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+# (Opcional) Buscar por código de rastreio — útil como fallback no front
 @app.get("/api/wbuy/tracking/<tracking_code>")
 def wbuy_by_tracking(tracking_code):
+    # 1) tenta com possíveis parâmetros de filtro
     for p in ["tracking", "rastreio", "codigo_rastreio", "codigo_rastreamento"]:
         try:
             url = f"{API_URL}/order?{p}={tracking_code}&limit=100"
@@ -271,69 +211,27 @@ def wbuy_by_tracking(tracking_code):
         except Exception:
             pass
 
+    # 2) fallback: varre algumas páginas recentes
+    try:
+        for page in range(1, 4):
+            url = f"{API_URL}/order?limit=100&page={page}"
+            r = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
+            if not r.ok:
+                break
+            arr = r.json().get("data") or []
+            for item in arr:
+                cand = _first_nonempty(
+                    item.get("tracking"),
+                    item.get("codigo_rastreio"),
+                    item.get("codigo_rastreamento"),
+                    item.get("rastreio"),
+                )
+                if cand and str(cand).strip().upper() == tracking_code.strip().upper():
+                    return jsonify(_normalize_order_json({"data": item}))
+    except Exception:
+        pass
+
     return jsonify({"error": "order_not_found"}), 404
-
-
-# ====== DEBUG (opcional) ======
-@app.get("/debug/contagem-produtos")
-def debug_contagem_produtos():
-    # conta total percorrendo offsets (pra validar que agora puxa tudo)
-    limit = 100
-    offset = 0
-    total = 0
-
-    for _ in range(500):
-        r = _wbuy_get_products_page(limit=limit, offset=offset, complete=0, ativo=1)
-        if not r.ok:
-            return make_response(r.text, r.status_code)
-        arr = (r.json().get("data") or [])
-        if not arr:
-            break
-        total += len(arr)
-        offset += limit
-        if len(arr) < limit:
-            break
-
-    return jsonify({"total_raw_estimado": total, "limit": limit})
-
-
-@app.get("/debug/procura-produto")
-def debug_procura_produto():
-    q = (request.args.get("q") or "").strip().lower()
-    if not q:
-        return jsonify({"error": "use ?q=termo"}), 400
-
-    limit = 100
-    offset = 0
-    achados = []
-
-    for _ in range(500):
-        r = _wbuy_get_products_page(limit=limit, offset=offset, complete=0, ativo=1)
-        if not r.ok:
-            return make_response(r.text, r.status_code)
-
-        arr = (r.json().get("data") or [])
-        if not arr:
-            break
-
-        for prod in arr:
-            nome = str(prod.get("produto", ""))
-            if q in nome.lower():
-                estoque = prod.get("estoque") or []
-                achados.append({
-                    "id": prod.get("id"),
-                    "cod": prod.get("cod"),
-                    "produto": nome,
-                    "ativo": prod.get("ativo"),
-                    "estoque_len": len(estoque) if isinstance(estoque, list) else None
-                })
-
-        offset += limit
-        if len(arr) < limit:
-            break
-
-    return jsonify({"q": q, "achados": achados, "achados_total": len(achados)})
-
 
 # ====== RUN ======
 if __name__ == "__main__":
