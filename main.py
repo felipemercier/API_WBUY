@@ -111,13 +111,41 @@ def _extrair_tamanho(variacao: dict) -> str:
     # Caso 3: grade (algumas integrações usam grade)
     grade = variacao.get("grade")
     if isinstance(grade, dict):
-        # tenta chaves comuns
         tamanho = grade.get("tamanho", tamanho) or grade.get("Tamanho", tamanho) or tamanho
 
     # Caso 4: fallback em campos comuns
     tamanho = variacao.get("tamanho", tamanho) or tamanho
 
     return str(tamanho)
+
+
+def _fetch_all_products(ativo: int = 1, complete: int = 1, limit: int = 100, max_loops: int = 500):
+    """
+    Busca TODOS os produtos da WBuy usando paginação por offset (WBuy NÃO aceita 'page').
+    """
+    all_items = []
+    offset = 0
+
+    for _ in range(max_loops):
+        url = f"{API_URL}/product/?ativo={ativo}&limit={limit}&offset={offset}&complete={complete}"
+        r = requests.get(url, headers=HEADERS, timeout=60)
+        if not r.ok:
+            # retorna texto cru para você enxergar o erro
+            raise Exception(f"HTTP {r.status_code}: {r.text[:300]}")
+
+        data = r.json()
+        chunk = data.get("data", []) or []
+        if not chunk:
+            break
+
+        all_items.extend(chunk)
+
+        if len(chunk) < limit:
+            break
+
+        offset += limit
+
+    return all_items
 
 
 # ====== SUAS ROTAS EXISTENTES ======
@@ -161,58 +189,27 @@ def concluir_pedido():
 @app.route("/importar-produtos", methods=["GET"])
 def importar_produtos():
     try:
+        produtos_raw = _fetch_all_products(ativo=1, complete=1, limit=100, max_loops=500)
+
         produtos_filtrados = []
+        for produto in produtos_raw:
+            nome = produto.get("produto", "sem nome")
+            estoque = produto.get("estoque", []) or []
+            if not isinstance(estoque, list):
+                estoque = []
 
-        page = 1
-        limit = 100  # a API parece limitar aqui
-        while True:
-            url = f"{API_URL}/product/?ativo=1&limit={limit}&page={page}&complete=1"
-            r = requests.get(url, headers=HEADERS, timeout=60)
-            if not r.ok:
-                return make_response(r.text, r.status_code)
+            for variacao in estoque:
+                if not isinstance(variacao, dict):
+                    continue
 
-            data = r.json()
-            produtos_raw = data.get("data", []) or []
-            if not produtos_raw:
-                break  # acabou
+                erp_id = variacao.get("erp_id", "sem erp_id")
+                tamanho = _extrair_tamanho(variacao)
 
-            for produto in produtos_raw:
-                nome = produto.get("produto", "sem nome")
-                estoque = produto.get("estoque", []) or []
-                if not isinstance(estoque, list):
-                    estoque = []
-
-                for variacao in estoque:
-                    if not isinstance(variacao, dict):
-                        continue
-
-                    erp_id = variacao.get("erp_id", "sem erp_id")
-
-                    # pega tamanho no formato antigo (Tamanho)
-                    tamanho = "sem tamanho"
-                    variacao_obj = variacao.get("variacao", {}) or {}
-                    if isinstance(variacao_obj, dict) and str(variacao_obj.get("nome", "")).lower() == "tamanho":
-                        tamanho = variacao_obj.get("valor", tamanho)
-
-                    # fallback: se existir campo "tamanho" direto
-                    if (tamanho == "sem tamanho") and variacao.get("tamanho"):
-                        tamanho = variacao.get("tamanho")
-
-                    produtos_filtrados.append({
-                        "produto": nome,
-                        "erp_id": erp_id,
-                        "tamanho": str(tamanho)
-                    })
-
-            # se veio menos que o limit, essa foi a última página
-            if len(produtos_raw) < limit:
-                break
-
-            page += 1
-
-            # proteção (evita loop infinito)
-            if page > 300:
-                break
+                produtos_filtrados.append({
+                    "produto": nome,
+                    "erp_id": erp_id,
+                    "tamanho": tamanho
+                })
 
         return jsonify(produtos_filtrados)
 
@@ -276,7 +273,7 @@ def wbuy_by_tracking(tracking_code):
         except Exception:
             pass
 
-    # 2) fallback: varre algumas páginas recentes
+    # 2) fallback: varre algumas páginas recentes (mantive como está)
     try:
         for page in range(1, 4):
             url = f"{API_URL}/order?limit=100&page={page}"
@@ -302,17 +299,13 @@ def wbuy_by_tracking(tracking_code):
 # ====== DEBUG (temporário) ======
 @app.get("/debug/contagem-produtos")
 def debug_contagem_produtos():
-    url = f"{API_URL}/product/?ativo=1&limit=9999&complete=1"
-    r = requests.get(url, headers=HEADERS, timeout=60)
-    if not r.ok:
-        return make_response(r.text, r.status_code)
-
-    data = r.json()
-    arr = data.get("data", []) or []
-    return jsonify({
-        "total_raw": len(arr),
-        "keys_data": list(data.keys())
-    })
+    try:
+        produtos_raw = _fetch_all_products(ativo=1, complete=1, limit=100, max_loops=500)
+        return jsonify({
+            "total_raw": len(produtos_raw)
+        })
+    except Exception as e:
+        return jsonify({"erro": str(e)}), 500
 
 @app.get("/debug/procura-produto")
 def debug_procura_produto():
@@ -320,27 +313,24 @@ def debug_procura_produto():
     if not q:
         return jsonify({"error": "use ?q=termo"}), 400
 
-    url = f"{API_URL}/product/?ativo=1&limit=9999&complete=1"
-    r = requests.get(url, headers=HEADERS, timeout=60)
-    if not r.ok:
-        return make_response(r.text, r.status_code)
+    try:
+        produtos_raw = _fetch_all_products(ativo=1, complete=1, limit=100, max_loops=500)
+        achados = []
 
-    arr = (r.json().get("data") or [])
-    achados = []
+        for prod in produtos_raw:
+            nome = str(prod.get("produto", ""))
+            if q in nome.lower():
+                estoque = prod.get("estoque") or []
+                achados.append({
+                    "id": prod.get("id"),
+                    "produto": nome,
+                    "ativo": prod.get("ativo"),
+                    "estoque_len": len(estoque) if isinstance(estoque, list) else None
+                })
 
-    for prod in arr:
-        nome = str(prod.get("produto", ""))
-        if q in nome.lower():
-            estoque = prod.get("estoque") or []
-            achados.append({
-                "id": prod.get("id"),
-                "produto": nome,
-                "ativo": prod.get("ativo"),
-                "estoque_tipo": str(type(estoque)),
-                "estoque_len": len(estoque) if isinstance(estoque, list) else None
-            })
-
-    return jsonify({"q": q, "achados": achados, "total_raw": len(arr)})
+        return jsonify({"q": q, "achados": achados, "total_raw": len(produtos_raw)})
+    except Exception as e:
+        return jsonify({"erro": str(e)}), 500
 
 @app.get("/debug/produto-raw")
 def debug_produto_raw():
@@ -348,19 +338,15 @@ def debug_produto_raw():
     if not termo:
         return jsonify({"error": "use ?q=termo"}), 400
 
-    url = f"{API_URL}/product/?ativo=1&limit=9999&complete=1"
-    r = requests.get(url, headers=HEADERS, timeout=60)
-    if not r.ok:
-        return make_response(r.text, r.status_code)
-
-    arr = (r.json().get("data") or [])
-    for prod in arr:
-        nome = str(prod.get("produto", "")).lower()
-        if termo in nome:
-            # Retorna o bruto (temporário)
-            return jsonify(prod)
-
-    return jsonify({"error": "not_found"}), 404
+    try:
+        produtos_raw = _fetch_all_products(ativo=1, complete=1, limit=100, max_loops=500)
+        for prod in produtos_raw:
+            nome = str(prod.get("produto", "")).lower()
+            if termo in nome:
+                return jsonify(prod)
+        return jsonify({"error": "not_found"}), 404
+    except Exception as e:
+        return jsonify({"erro": str(e)}), 500
 
 
 # ====== RUN ======
