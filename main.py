@@ -3,6 +3,7 @@ from flask_cors import CORS
 import requests
 import os
 from dotenv import load_dotenv
+import xml.etree.ElementTree as ET
 
 load_dotenv()
 
@@ -22,7 +23,13 @@ HEADERS = {
 
 TIMEOUT = 30
 
-# ====== Helpers (NOVOS) ======
+# ====== XML Avançado (catálogo completo) ======
+XML_URL = os.getenv(
+    "WBUY_XML_URL",
+    "https://sistema.sistemawbuy.com.br/xmlavancado/0dd5a2fcdb3bc2fc27915cfea8d3624b/produtos.xml"
+)
+
+# ====== Helpers ======
 def _safe_float(x, default=0.0):
     try:
         return float(str(x).replace(",", "."))
@@ -87,7 +94,46 @@ def _normalize_order_json(payload):
         "shipping_total": _safe_float(shipping_total, 0.0),
     }
 
-# ====== SUAS ROTAS EXISTENTES (inalteradas) ======
+def _clean_text(s):
+    if s is None:
+        return ""
+    # ElementTree pode devolver string com espaços/quebras
+    return str(s).strip()
+
+def _parse_xml_produtos(xml_bytes: bytes):
+    """
+    Lê o XML avançado e devolve lista no formato:
+    [{produto, erp_id, tamanho}]
+    Observação: o XML vem com namespace g:
+    """
+    root = ET.fromstring(xml_bytes)
+
+    ns = {"g": "http://base.google.com/ns/1.0"}
+    produtos = []
+
+    for item in root.findall(".//item"):
+        # Nome: pode vir em <title> (sem namespace)
+        title_el = item.find("title")
+        produto_nome = _clean_text(title_el.text if title_el is not None else "sem nome")
+
+        # ERP/SKU: normalmente em <g:id>
+        gid_el = item.find("g:id", ns)
+        erp_id = _clean_text(gid_el.text if gid_el is not None else "sem erp_id")
+
+        # Tamanho: normalmente em <g:size>
+        size_el = item.find("g:size", ns)
+        tamanho = _clean_text(size_el.text if size_el is not None else "sem tamanho")
+
+        produtos.append({
+            "produto": produto_nome,
+            "erp_id": erp_id,
+            "tamanho": tamanho
+        })
+
+    return produtos
+
+
+# ====== SUAS ROTAS EXISTENTES ======
 @app.route("/")
 def home():
     return "API da Martier rodando com todas as rotas!"
@@ -125,8 +171,34 @@ def concluir_pedido():
         return jsonify({"success": True}), 200
     return make_response(r.text, r.status_code)
 
+# ====== IMPORTAÇÃO DE PRODUTOS (agora com modo REST ou XML) ======
 @app.route("/importar-produtos", methods=["GET"])
 def importar_produtos():
+    """
+    Por padrão, importa via XML (catálogo completo).
+    Se quiser forçar REST (o que pode vir incompleto), use:
+      /importar-produtos?fonte=rest
+    """
+    fonte = (request.args.get("fonte") or "xml").strip().lower()
+
+    # ---------- VIA XML (recomendado) ----------
+    if fonte == "xml":
+        try:
+            r = requests.get(XML_URL, timeout=60)
+            if not r.ok:
+                return make_response(r.text, r.status_code)
+
+            produtos = _parse_xml_produtos(r.content)
+
+            # Mantém o retorno compatível com o seu front:
+            # antes você retornava uma lista pura.
+            # Aqui vamos retornar lista pura também.
+            return jsonify(produtos)
+
+        except Exception as e:
+            return jsonify({"erro": str(e)}), 500
+
+    # ---------- VIA REST (legado / pode não trazer todos) ----------
     url = f"{API_URL}/product/?ativo=1&limit=9999&complete=1"
     try:
         r = requests.get(url, headers=HEADERS, timeout=60)
@@ -172,6 +244,7 @@ def buscar_observacoes(pedido_id):
         return jsonify({"observacoes": observacoes})
     except Exception as e:
         return jsonify({"erro": str(e)}), 500
+
 
 # ====== ROTAS NOVAS (mínimas, para o front) ======
 @app.get("/api/ping")
@@ -232,6 +305,26 @@ def wbuy_by_tracking(tracking_code):
         pass
 
     return jsonify({"error": "order_not_found"}), 404
+
+
+# ====== DEBUG (pra você conferir rápido o XML) ======
+@app.get("/debug/xml-info")
+def debug_xml_info():
+    try:
+        r = requests.get(XML_URL, timeout=60)
+        if not r.ok:
+            return make_response(r.text, r.status_code)
+        produtos = _parse_xml_produtos(r.content)
+        exemplo = produtos[0] if produtos else None
+        return jsonify({
+            "ok": True,
+            "xml_url": XML_URL,
+            "total": len(produtos),
+            "exemplo": exemplo
+        })
+    except Exception as e:
+        return jsonify({"ok": False, "erro": str(e)}), 500
+
 
 # ====== RUN ======
 if __name__ == "__main__":
