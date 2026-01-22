@@ -23,7 +23,7 @@ HEADERS = {
 TIMEOUT = 30
 
 # ====== XML Avançado ======
-XML_URL = "https://sistema.sistemawbuy.com.br/xmlavancado/0dd5a2fcdb3bc2fc27915cfea8d3624b/produtos.xml"
+XML_URL = "https://sistema.sistemawbuy.com.br/xmlavancado/7401c1aaec5c2826807d96b906be80b8/produtos.xml"
 NS = {"g": "http://base.google.com/ns/1.0"}
 
 # ====== Helpers ======
