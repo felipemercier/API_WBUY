@@ -53,16 +53,16 @@ def health():
 @app.get("/debug/wbuy")
 def debug_wbuy():
     try:
-        r, j = wbuy_get_json("/product/", params={"page": 1, "limit": 1})
+        r = wbuy_get_raw("/product/", params={"limit": 1})
         return jsonify({
             "ok": True,
             "status_code": r.status_code,
             "content_type": r.headers.get("content-type", ""),
-            "sample_json_keys": list(j.keys()) if isinstance(j, dict) else None,
             "sample_body": (r.text[:500] if r.text else "")
         }), 200
     except Exception as e:
         return safe_error(str(e), 500, {"trace": traceback.format_exc()})
+
 
 @app.get("/wbuy/produtos")
 def wbuy_produtos():
