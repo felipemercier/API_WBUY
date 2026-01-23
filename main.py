@@ -1,210 +1,179 @@
-from flask import Flask, jsonify, request
-import requests
 import os
 import time
 import traceback
+from flask import Flask, jsonify, request
+from flask_cors import CORS
+import requests
+from dotenv import load_dotenv
+
+load_dotenv()
 
 app = Flask(__name__)
+CORS(app, resources={r"/*": {"origins": "*"}})
 
 API_URL = "https://sistema.sistemawbuy.com.br/api/v1"
-TOKEN = os.getenv("WBUY_TOKEN", "")
-TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "45"))
+TOKEN = os.getenv("WBUY_TOKEN", "").strip()
 
-def headers():
+TIMEOUT = 30
+
+def safe_error(message, status=500, extra=None):
+    payload = {"ok": False, "error": message}
+    if extra:
+        payload.update(extra)
+    return jsonify(payload), status
+
+def wbuy_headers():
+    if not TOKEN:
+        return None
     return {
         "Authorization": f"Bearer {TOKEN}",
         "Accept": "application/json",
         "Content-Type": "application/json",
     }
 
-def safe_error(msg, status=500, extra=None):
-    payload = {"ok": False, "error": msg}
-    if extra:
-        payload["extra"] = extra
-    return jsonify(payload), status
+def wbuy_get(path, params=None):
+    headers = wbuy_headers()
+    if headers is None:
+        raise RuntimeError("WBUY_TOKEN ausente no Environment.")
 
-def wbuy_get_raw(path, params=None):
     url = f"{API_URL}{path}"
-    r = requests.get(url, headers=headers(), params=params or {}, timeout=TIMEOUT)
-    return r
+    r = requests.get(url, headers=headers, params=params or {}, timeout=TIMEOUT)
 
-def wbuy_get_json(path, params=None):
-    r = wbuy_get_raw(path, params=params)
-    # tenta json mesmo em erro
-    try:
-        j = r.json()
-    except Exception:
-        j = None
-    return r, j
+    # Se a WBuy devolver HTML em erro, isso evita explodir no .json()
+    ct = (r.headers.get("content-type") or "").lower()
+    if "application/json" not in ct:
+        raise RuntimeError(f"WBuy retornou não-JSON ({r.status_code}). Body: {r.text[:200]}")
 
-@app.get("/")
-def home():
-    return jsonify({"ok": True, "msg": "Martier API rodando"}), 200
+    data = r.json()
+    # alguns erros vem em JSON mesmo com 200
+    if str(data.get("responseCode", "")) not in ("200", 200) and data.get("code") not in ("010", "010"):
+        raise RuntimeError(f"WBuy erro: {data}")
+
+    return data
+
+def normalize_stock_item(item: dict) -> dict:
+    """
+    Queremos: produto + variação (e opcional cor), por SKU.
+    O /product/stock/ costuma trazer campos como:
+      - sku
+      - produto / produto_url
+      - variacao: { nome, valor }
+      - cor: { nome }
+      - ativo / venda
+    """
+    variacao = item.get("variacao") or {}
+    cor = item.get("cor") or {}
+
+    return {
+        "sku": item.get("sku") or "",
+        "produto": item.get("produto") or item.get("produto_nome") or "",
+        "produto_url": item.get("produto_url") or "",
+        "variacao_nome": variacao.get("nome") or "",
+        "variacao_valor": variacao.get("valor") or "",
+        "cor_nome": cor.get("nome") or "",
+        "ativo": str(item.get("ativo", "")),
+        "venda": str(item.get("venda", "")),
+    }
+
+def paginate_stock(page_size=200, sleep_ms=0, only_active=False, only_sale=False):
+    """
+    Pagina automaticamente no /product/stock/ usando limit=offset,page_size
+    Retorna lista de itens normalizados.
+    """
+    offset = 0
+    total = None
+    out = []
+
+    while True:
+        params = {"limit": f"{offset},{page_size}"}
+        data = wbuy_get("/product/stock/", params=params)
+
+        if total is None:
+            try:
+                total = int(data.get("total", 0))
+            except Exception:
+                total = 0
+
+        items = data.get("data") or []
+        if not items:
+            break
+
+        for it in items:
+            row = normalize_stock_item(it)
+
+            if only_active and row["ativo"] != "1":
+                continue
+            if only_sale and row["venda"] != "1":
+                continue
+
+            # você disse que não precisa de estoque, então não retornamos qty
+            out.append({
+                "sku": row["sku"],
+                "produto": row["produto"],
+                "variacao": row["variacao_valor"] or row["variacao_nome"],  # fallback
+                "cor": row["cor_nome"],
+                "produto_url": row["produto_url"],
+            })
+
+        offset += page_size
+
+        # para quando já passou do total
+        if total and offset >= total:
+            break
+
+        if sleep_ms and sleep_ms > 0:
+            time.sleep(sleep_ms / 1000.0)
+
+    return out, total or len(out)
 
 @app.get("/health")
 def health():
-    return jsonify({
-        "ok": True,
-        "token_loaded": bool(TOKEN),
-        "timeout": TIMEOUT
-    }), 200
+    return jsonify({"ok": True, "token_loaded": bool(TOKEN)})
 
-# --- debug pra ver se WBuy está respondendo ---
-@app.get("/debug/wbuy")
-def debug_wbuy():
-    try:
-        r = wbuy_get_raw("/product/", params={"limit": 1})
-        return jsonify({
-            "ok": True,
-            "status_code": r.status_code,
-            "content_type": r.headers.get("content-type", ""),
-            "sample_body": (r.text[:500] if r.text else "")
-        }), 200
-    except Exception as e:
-        return safe_error(str(e), 500, {"trace": traceback.format_exc()})
-
-
-@app.get("/wbuy/produtos")
-def wbuy_produtos():
+@app.get("/wbuy/skus")
+def wbuy_skus_all():
     """
-    Retorna lista de produtos.
+    Retorna TODOS os SKUs (produto + variação + cor) paginando automático.
     Query:
-      - limit (int) opcional: se quiser só primeiros N itens da lista
+      - page_size (default 200)
+      - sleep_ms (default 0) -> se quiser desacelerar
     """
     try:
-        r, j = wbuy_get_json("/product/")
-        if r.status_code != 200:
-            return safe_error("WBuy respondeu com erro", 502, {
-                "status_code": r.status_code,
-                "body": r.text[:800]
-            })
+        page_size = int(request.args.get("page_size", 200))
+        sleep_ms = int(request.args.get("sleep_ms", 0))
 
-        if not isinstance(j, dict):
-            return safe_error("Resposta da WBuy não veio em JSON esperado", 502, {
-                "body": r.text[:800]
-            })
-
-        data = j.get("data") or []
-        total = j.get("total")
-
-        # opcional: cortar para não enviar resposta gigantesca no browser
-        limit = request.args.get("limit")
-        if limit:
-            data = data[:int(limit)]
+        rows, total = paginate_stock(page_size=page_size, sleep_ms=sleep_ms, only_active=False, only_sale=False)
 
         return jsonify({
             "ok": True,
             "total": total,
-            "retornados": len(data),
-            "data": data
-        }), 200
-
+            "retornados": len(rows),
+            "data": rows
+        })
     except Exception as e:
         return safe_error(str(e), 500, {"trace": traceback.format_exc()})
 
-@app.get("/wbuy/produto/<pid>")
-def wbuy_produto(pid):
-    try:
-        r, j = wbuy_get_json("/product/", params={"id": str(pid)})
-        if r.status_code != 200:
-            return safe_error("WBuy respondeu com erro", 502, {
-                "status_code": r.status_code,
-                "body": r.text[:800]
-            })
-
-        itens = (j or {}).get("data") or []
-        if not itens:
-            return safe_error("Produto não encontrado", 404)
-
-        return jsonify({"ok": True, "data": itens[0]}), 200
-
-    except Exception as e:
-        return safe_error(str(e), 500, {"trace": traceback.format_exc()})
-
-def extrair_skus_ativos(prod):
-    skus = []
-    for sku in (prod.get("estoque") or []):
-        if str(sku.get("ativo", "")) == "1":
-            valores = sku.get("valores") or []
-            preco = valores[0].get("valor") if valores else ""
-            skus.append({
-                "produto_id": str(prod.get("id", "")),
-                "produto": prod.get("produto", ""),
-                "cod_produto": prod.get("cod", ""),
-                "sku_id": str(sku.get("id", "")),
-                "sku": sku.get("sku", ""),
-                "tamanho": (sku.get("variacao") or {}).get("valor", ""),
-                "quantidade": sku.get("quantidade_em_estoque", ""),
-                "preco": preco
-            })
-    return skus
-
-@app.get("/skus/ativos")
-def skus_ativos():
+@app.get("/wbuy/skus/ativos")
+def wbuy_skus_active():
     """
+    Retorna somente SKUs ativos (opcionalmente apenas vendáveis).
     Query:
-      - limit_produtos (int) default 200
-      - sleep_ms (int) default 50
+      - page_size (default 200)
+      - sleep_ms (default 0)
+      - only_sale=1 (default 0) -> filtra venda == 1
     """
-    limit_produtos = int(request.args.get("limit_produtos", "200"))
-    sleep_ms = int(request.args.get("sleep_ms", "50"))
-
     try:
-        # pega lista geral
-        r, j = wbuy_get_json("/product/")
-        if r.status_code != 200:
-            return safe_error("Erro ao listar produtos na WBuy", 502, {
-                "status_code": r.status_code,
-                "body": r.text[:800]
-            })
+        page_size = int(request.args.get("page_size", 200))
+        sleep_ms = int(request.args.get("sleep_ms", 0))
+        only_sale = request.args.get("only_sale", "0") in ("1", "true", "True")
 
-        produtos = (j or {}).get("data") or []
-        produtos = produtos[:limit_produtos]
-
-        skus = []
-        erros = []
-
-        for p in produtos:
-            pid = p.get("id")
-            if not pid:
-                continue
-
-            try:
-                rr, jj = wbuy_get_json("/product/", params={"id": str(pid)})
-                if rr.status_code != 200:
-                    erros.append({"produto_id": str(pid), "status": rr.status_code, "body": rr.text[:200]})
-                    continue
-
-                itens = (jj or {}).get("data") or []
-                if not itens:
-                    continue
-
-                skus.extend(extrair_skus_ativos(itens[0]))
-
-            except Exception as ie:
-                erros.append({"produto_id": str(pid), "erro": str(ie)})
-
-            if sleep_ms > 0:
-                time.sleep(sleep_ms / 1000.0)
+        rows, total = paginate_stock(page_size=page_size, sleep_ms=sleep_ms, only_active=True, only_sale=only_sale)
 
         return jsonify({
             "ok": True,
-            "produtos_processados": len(produtos),
-            "skus_ativos": len(skus),
-            "erros_count": len(erros),
-            "erros": erros[:20],  # não explode resposta
-            "data": skus
-        }), 200
-
+            "total_estoques_api": total,      # total que a WBuy reporta no endpoint
+            "retornados": len(rows),
+            "data": rows
+        })
     except Exception as e:
         return safe_error(str(e), 500, {"trace": traceback.format_exc()})
-
-@app.get("/skus/ativos/resumo")
-def skus_ativos_resumo():
-    # só chama o endpoint completo mas reduz output
-    r = skus_ativos()
-    # r pode ser (json, status)
-    return r
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")))
