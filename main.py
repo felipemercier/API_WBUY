@@ -60,7 +60,11 @@ def api_estoque():
 
 @app.get("/health")
 def health():
-    return jsonify({"ok": True})
+    return jsonify({
+        "ok": True,
+        "token_loaded": bool(TOKEN)
+    }), 200
+
 
 
 if __name__ == "__main__":
