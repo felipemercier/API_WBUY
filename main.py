@@ -64,7 +64,7 @@ def wbuy_get(path, params=None):
     code = data.get("code")
 
     ok_by_response_code = str(response_code) in ("200", "201")
-    ok_by_code = str(code) in ("010",)  # docs costumam indicar sucesso como "010"
+    ok_by_code = str(code) in ("010",)  # sucesso costuma ser "010" nos docs exibidos
 
     if not (ok_by_response_code or ok_by_code):
         raise RuntimeError(f"WBuy erro: {data}")
@@ -78,14 +78,22 @@ def normalize_stock_item(item: dict) -> dict:
       - sku, produto, produto_url
       - tamanho (variação)
       - cor
-      - qty (quantidade em estoque)  <-- essencial para grade
+      - qty (quantidade em estoque)
       - ativo, venda
+
+    Correção: em algumas contas, "produto" pode vir como dict -> pegamos produto['nome'].
     """
     variacao = item.get("variacao") or {}
     cor = item.get("cor") or {}
 
+    # produto pode vir como dict (unhashable)
+    produto_raw = item.get("produto")
+    if isinstance(produto_raw, dict):
+        produto_nome = (produto_raw.get("nome") or produto_raw.get("titulo") or "").strip()
+    else:
+        produto_nome = (produto_raw or item.get("produto_nome") or "").strip()
+
     # A WBuy pode variar o nome do campo de quantidade.
-    # Mantemos fallback para cobrir variações mais comuns.
     qty_raw = (
         item.get("estoque")
         if item.get("estoque") is not None else
@@ -98,14 +106,21 @@ def normalize_stock_item(item: dict) -> dict:
     qty = to_int(qty_raw, 0)
 
     tamanho = (variacao.get("valor") or variacao.get("nome") or "").strip()
-    cor_nome = (cor.get("nome") or "").strip()
+
+    # cor pode vir como dict, mas aqui já pegamos o nome
+    cor_nome = ""
+    cor_raw = item.get("cor")
+    if isinstance(cor_raw, dict):
+        cor_nome = (cor_raw.get("nome") or cor_raw.get("titulo") or "").strip()
+    else:
+        cor_nome = (cor.get("nome") or "").strip()
 
     return {
         "sku": item.get("sku") or "",
-        "produto": item.get("produto") or item.get("produto_nome") or "",
+        "produto": produto_nome or "SEM_PRODUTO",
         "produto_url": item.get("produto_url") or "",
-        "tamanho": tamanho,
-        "cor": cor_nome,
+        "tamanho": tamanho or "SEM_TAMANHO",
+        "cor": cor_nome or "SEM_COR",
         "qty": qty,
         "ativo": str(item.get("ativo", "")),
         "venda": str(item.get("venda", "")),
@@ -192,7 +207,7 @@ def wbuy_skus_all():
             base = {
                 "sku": r["sku"],
                 "produto": r["produto"],
-                "variacao": r["tamanho"],  # compatível: antes era variacao_valor/nome
+                "variacao": r["tamanho"],
                 "cor": r["cor"],
                 "produto_url": r["produto_url"],
             }
@@ -335,7 +350,7 @@ def estoque_grade():
 
                 cores_list.append({
                     "cor": cor_name,
-                    "tamanhos": tamanhos,           # ex: {"P": 3, "M": 0, "G": 2}
+                    "tamanhos": tamanhos,
                     "desgradiado": bool(faltando),
                     "faltando": faltando
                 })
@@ -359,7 +374,5 @@ def estoque_grade():
 
 
 if __name__ == "__main__":
-    # Em produção (Render/Hostinger), geralmente você não usa isso,
-    # mas manter não quebra e ajuda local.
     port = int(os.getenv("PORT", "5000"))
     app.run(host="0.0.0.0", port=port, debug=False)
