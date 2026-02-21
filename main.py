@@ -184,11 +184,24 @@ def estoque_grade():
         return safe_error(str(e), 500, {"trace": traceback.format_exc()})
 
 
+# ✅ Mantido exatamente como estava (para não afetar outros sistemas)
 @app.get("/wbuy/skus")
 def wbuy_skus():
     try:
         page_size = to_int(request.args.get("page_size", 200), 200)
         rows, total = paginate_stock(page_size=page_size, only_active=False, only_sale=False)
+        return jsonify({"ok": True, "total": total, "data": rows})
+    except Exception as e:
+        return safe_error(str(e), 500, {"trace": traceback.format_exc()})
+
+
+# ✅ NOVO: rota pedida pelo seu front (corrige o 404) sem mexer no resto
+@app.get("/wbuy/skus/ativos")
+def wbuy_skus_ativos():
+    try:
+        page_size = to_int(request.args.get("page_size", 200), 200)
+        # "ativos + vendáveis" (mesmo padrão do estoque-grade)
+        rows, total = paginate_stock(page_size=page_size, only_active=True, only_sale=True)
         return jsonify({"ok": True, "total": total, "data": rows})
     except Exception as e:
         return safe_error(str(e), 500, {"trace": traceback.format_exc()})
