@@ -15,6 +15,20 @@ API_URL = "https://sistema.sistemawbuy.com.br/api/v1"
 TOKEN = os.getenv("WBUY_TOKEN", "").strip()
 TIMEOUT = 30
 
+# ===== Cache simples em memória (não afeta rotas antigas) =====
+CACHE = {}
+def cache_get(key, ttl_sec=600):
+    item = CACHE.get(key)
+    if not item:
+        return None
+    ts, data = item
+    if time.time() - ts > ttl_sec:
+        return None
+    return data
+
+def cache_set(key, data):
+    CACHE[key] = (time.time(), data)
+
 
 def safe_error(message, status=500, extra=None):
     payload = {"ok": False, "error": message}
@@ -184,7 +198,7 @@ def estoque_grade():
         return safe_error(str(e), 500, {"trace": traceback.format_exc()})
 
 
-# ✅ Mantido exatamente como estava (para não afetar outros sistemas)
+# ===== ROTA ANTIGA (MANTIDA 100% IGUAL) =====
 @app.get("/wbuy/skus")
 def wbuy_skus():
     try:
@@ -195,14 +209,50 @@ def wbuy_skus():
         return safe_error(str(e), 500, {"trace": traceback.format_exc()})
 
 
-# ✅ NOVO: rota pedida pelo seu front (corrige o 404) sem mexer no resto
+# ===== NOVA ROTA (para o seu main.js) =====
+# URL: /wbuy/skus/ativos
+# Retorna ativos + vendáveis (igual padrão do estoque-grade)
+# Tem cache de 10min pra não travar e não chamar WBuy toda hora
 @app.get("/wbuy/skus/ativos")
 def wbuy_skus_ativos():
     try:
         page_size = to_int(request.args.get("page_size", 200), 200)
-        # "ativos + vendáveis" (mesmo padrão do estoque-grade)
+
+        cache_key = f"skus_ativos_ps{page_size}"
+        cached = cache_get(cache_key, ttl_sec=600)
+        if cached:
+            return jsonify(cached)
+
         rows, total = paginate_stock(page_size=page_size, only_active=True, only_sale=True)
-        return jsonify({"ok": True, "total": total, "data": rows})
+
+        payload = {"ok": True, "total": total, "data": rows}
+        cache_set(cache_key, payload)
+        return jsonify(payload)
+
+    except Exception as e:
+        return safe_error(str(e), 500, {"trace": traceback.format_exc()})
+
+
+# ===== ROTA EXTRA (opcional) só pra teste rápido =====
+# Não muda nada em outros sistemas.
+@app.get("/wbuy/skus/ativos-fast")
+def wbuy_skus_ativos_fast():
+    try:
+        page_size = to_int(request.args.get("page_size", 200), 200)
+        # só 1 página (offset 0), pra testar sem travar
+        data = wbuy_get("/product/stock/", params={"limit": f"0,{page_size}"})
+        items = data.get("data") or []
+        out = []
+        for it in items:
+            row = normalize_stock_item(it)
+            if row["ativo"] != "1":
+                continue
+            if row["venda"] != "1":
+                continue
+            out.append(row)
+
+        return jsonify({"ok": True, "total": len(out), "data": out})
+
     except Exception as e:
         return safe_error(str(e), 500, {"trace": traceback.format_exc()})
 
