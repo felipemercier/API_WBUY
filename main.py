@@ -15,7 +15,9 @@ API_URL = "https://sistema.sistemawbuy.com.br/api/v1"
 TOKEN = os.getenv("WBUY_TOKEN", "").strip()
 TIMEOUT = 30
 
-# ===== Cache simples em memória (não afeta rotas antigas) =====
+# =========================================================
+# ================= CACHE SIMPLES EM MEMÓRIA ==============
+# =========================================================
 CACHE = {}
 
 def cache_get(key, ttl_sec=600):
@@ -31,6 +33,9 @@ def cache_set(key, data):
     CACHE[key] = (time.time(), data)
 
 
+# =========================================================
+# ======================== HELPERS ========================
+# =========================================================
 def safe_error(message, status=500, extra=None):
     payload = {"ok": False, "error": message}
     if extra:
@@ -58,28 +63,43 @@ def wbuy_headers():
 def wbuy_get(path, params=None):
     headers = wbuy_headers()
     if headers is None:
-        raise RuntimeError("WBUY_TOKEN ausente no Environment (Render).")
+        raise RuntimeError("WBUY_TOKEN ausente no Environment.")
 
     url = f"{API_URL}{path}"
     r = requests.get(url, headers=headers, params=params or {}, timeout=TIMEOUT)
 
     ct = (r.headers.get("content-type") or "").lower()
     if "application/json" not in ct:
-        raise RuntimeError(f"WBuy retornou não-JSON ({r.status_code}). Body: {r.text[:200]}")
+        raise RuntimeError(f"WBuy retornou não-JSON ({r.status_code}). Body: {r.text[:300]}")
 
     data = r.json()
 
-    # considera sucesso por responseCode/code
     rc = str(data.get("responseCode", ""))
     code = str(data.get("code", ""))
-    if rc not in ("200", "201") and code not in ("010",):
+
+    # aceita formatos comuns de sucesso
+    if rc not in ("200", "201", "") and code not in ("010", "1", ""):
         raise RuntimeError(f"WBuy erro: {data}")
 
     return data
 
 
+def get_nested(obj, path, default=""):
+    try:
+        cur = obj
+        for p in path:
+            if not isinstance(cur, dict):
+                return default
+            cur = cur.get(p)
+        return cur if cur is not None else default
+    except Exception:
+        return default
+
+
+# =========================================================
+# ====================== ESTOQUE WBUY =====================
+# =========================================================
 def normalize_stock_item(item):
-    # produto vem como dict na sua conta
     produto_obj = item.get("produto") or {}
     produto_nome = (produto_obj.get("produto") or produto_obj.get("nome") or "SEM_PRODUTO").strip()
 
@@ -89,7 +109,6 @@ def normalize_stock_item(item):
     cor_obj = item.get("cor") or {}
     cor_nome = (cor_obj.get("nome") or "SEM_COR").strip()
 
-    # campo real do estoque na sua conta
     qty = to_int(item.get("quantidade_em_estoque"), 0)
 
     return {
@@ -140,25 +159,64 @@ def paginate_stock(page_size=200, sleep_ms=0, only_active=False, only_sale=False
 
 
 # =========================================================
-# ================ NOVAS FUNÇÕES DE PEDIDOS ===============
+# ====================== PEDIDOS WBUY =====================
 # =========================================================
+def extract_order_list(data):
+    if isinstance(data, dict):
+        if isinstance(data.get("data"), list):
+            return data.get("data")
+        if isinstance(data.get("orders"), list):
+            return data.get("orders")
+        if isinstance(data.get("pedidos"), list):
+            return data.get("pedidos")
+        if isinstance(data.get("result"), list):
+            return data.get("result")
+    if isinstance(data, list):
+        return data
+    return []
 
-def get_nested(obj, path, default=""):
-    try:
-        cur = obj
-        for p in path:
-            if not isinstance(cur, dict):
-                return default
-            cur = cur.get(p)
-        return cur if cur is not None else default
-    except Exception:
-        return default
+
+def paginate_orders(page_size=100, sleep_ms=0, status_filter=None, max_pages=20):
+    offset = 0
+    total = None
+    out = []
+    pages = 0
+
+    while True:
+        params = {"limit": f"{offset},{page_size}"}
+        if status_filter:
+            params["status"] = status_filter
+
+        data = wbuy_get("/order/", params=params)
+
+        if total is None:
+            total = to_int(data.get("total", 0), 0)
+
+        items = extract_order_list(data)
+        if not items:
+            break
+
+        out.extend(items)
+
+        offset += page_size
+        pages += 1
+
+        if total and offset >= total:
+            break
+
+        if max_pages and pages >= max_pages:
+            break
+
+        if sleep_ms and sleep_ms > 0:
+            time.sleep(sleep_ms / 1000.0)
+
+    return out, total or len(out)
 
 
 def normalize_order_item(item):
     cliente_obj = item.get("cliente") or item.get("customer") or {}
     endereco_obj = item.get("endereco_entrega") or item.get("shipping_address") or {}
-    transporte_obj = item.get("transporte") or item.get("frete") or item.get("shipping") or {}
+    frete_obj = item.get("frete") or {}
 
     pedido_id = (
         item.get("pedido_id")
@@ -210,37 +268,45 @@ def normalize_order_item(item):
     )
 
     forma_envio = (
-        item.get("forma_envio")
+        frete_obj.get("nome")
+        or item.get("forma_envio")
         or item.get("servico_frete")
-        or item.get("tipo_frete")
         or item.get("shipping_method")
-        or get_nested(transporte_obj, ["nome"], "")
-        or get_nested(transporte_obj, ["servico"], "")
-        or get_nested(transporte_obj, ["descricao"], "")
         or ""
     )
 
     transportadora = (
-        item.get("transportadora")
+        frete_obj.get("tipo_envio_nome")
+        or item.get("transportadora")
         or item.get("nome_transportadora")
-        or get_nested(transporte_obj, ["transportadora"], "")
-        or get_nested(transporte_obj, ["nome"], "")
         or ""
     )
 
     codigo_rastreio = (
-        item.get("codigo_rastreio")
+        frete_obj.get("rastreio")
+        or item.get("codigo_rastreio")
         or item.get("rastreamento")
         or item.get("tracking")
         or item.get("tracking_code")
-        or get_nested(transporte_obj, ["codigo_rastreio"], "")
-        or get_nested(transporte_obj, ["tracking"], "")
+        or ""
+    )
+
+    rastreio_url = (
+        frete_obj.get("rastreio_url")
+        or item.get("rastreio_url")
+        or ""
+    )
+
+    prazo = (
+        frete_obj.get("prazo")
+        or item.get("prazo_entrega")
         or ""
     )
 
     cpf_cnpj = (
         get_nested(item, ["cliente", "cpf_cnpj"], "")
         or get_nested(item, ["cliente", "cpf"], "")
+        or get_nested(item, ["cliente", "doc1"], "")
         or get_nested(item, ["customer", "document"], "")
         or ""
     )
@@ -254,6 +320,7 @@ def normalize_order_item(item):
     telefone = (
         get_nested(item, ["cliente", "telefone"], "")
         or get_nested(item, ["cliente", "celular"], "")
+        or get_nested(item, ["cliente", "fone"], "")
         or get_nested(item, ["customer", "phone"], "")
         or ""
     )
@@ -261,6 +328,7 @@ def normalize_order_item(item):
     cidade = (
         endereco_obj.get("cidade")
         or endereco_obj.get("city")
+        or get_nested(cliente_obj, ["cidade"], "")
         or ""
     )
 
@@ -268,6 +336,7 @@ def normalize_order_item(item):
         endereco_obj.get("estado")
         or endereco_obj.get("uf")
         or endereco_obj.get("state")
+        or get_nested(cliente_obj, ["estado"], "")
         or ""
     )
 
@@ -281,6 +350,8 @@ def normalize_order_item(item):
         "forma_envio": str(forma_envio),
         "transportadora": str(transportadora),
         "codigo_rastreio": str(codigo_rastreio),
+        "rastreio_url": str(rastreio_url),
+        "prazo": str(prazo),
         "cpf_cnpj": str(cpf_cnpj),
         "email": str(email),
         "telefone": str(telefone),
@@ -291,90 +362,44 @@ def normalize_order_item(item):
 
 
 def contains_jt_shipping(item, normalized_row=None):
+    frete = item.get("frete") or {}
     row = normalized_row or normalize_order_item(item)
 
-    chunks = [
-        row.get("forma_envio", ""),
-        row.get("transportadora", ""),
-        row.get("codigo_rastreio", ""),
-        str(item)
-    ]
-    txt = " ".join(chunks).lower()
+    nome = (frete.get("nome") or row.get("forma_envio") or "").lower()
+    tipo = (frete.get("tipo_envio_nome") or row.get("transportadora") or "").lower()
+    rastreio = (frete.get("rastreio") or row.get("codigo_rastreio") or "").strip()
 
-    needles = [
-        "j&t",
-        "j&t express",
-        "jt express",
-        "jtexpress",
-        "jt-",
-        "jt_",
-        "jt ez",
-        "jt-ez",
-        "jet",
-        "expresso comum"
-    ]
+    if "j&t" in nome or "j&t" in tipo:
+        return True
 
-    return any(n in txt for n in needles)
+    if rastreio.startswith("888"):
+        return True
+
+    return False
 
 
-def extract_order_list(data):
-    if isinstance(data, dict):
-        if isinstance(data.get("data"), list):
-            return data.get("data")
-        if isinstance(data.get("orders"), list):
-            return data.get("orders")
-        if isinstance(data.get("pedidos"), list):
-            return data.get("pedidos")
-        if isinstance(data.get("result"), list):
-            return data.get("result")
-    if isinstance(data, list):
-        return data
-    return []
+def row_matches_status(row, status_param):
+    if not status_param:
+        return True
+
+    status_txt = (row.get("status") or "").strip().lower()
+    return status_param in status_txt
 
 
-def paginate_orders(page_size=100, sleep_ms=0, status_filter=None, max_pages=20):
-    offset = 0
-    total = None
-    out = []
-    pages = 0
-
-    while True:
-        params = {"limit": f"{offset},{page_size}"}
-
-        # se a conta aceitar o filtro por status, melhor.
-        # se não aceitar, ainda vamos filtrar localmente depois.
-        if status_filter:
-            params["status"] = status_filter
-
-        data = wbuy_get("/order/", params=params)
-
-        if total is None:
-            total = to_int(data.get("total", 0), 0)
-
-        items = extract_order_list(data)
-        if not items:
-            break
-
-        out.extend(items)
-
-        offset += page_size
-        pages += 1
-
-        if total and offset >= total:
-            break
-
-        if max_pages and pages >= max_pages:
-            break
-
-        if sleep_ms and sleep_ms > 0:
-            time.sleep(sleep_ms / 1000.0)
-
-    return out, total or len(out)
-
-
+# =========================================================
+# ========================= ROTAS =========================
+# =========================================================
 @app.get("/health")
 def health():
     return jsonify({"ok": True, "token_loaded": bool(TOKEN)})
+
+
+@app.get("/")
+def home():
+    return jsonify({
+        "ok": True,
+        "message": "API da Martier rodando com todas as rotas!"
+    })
 
 
 @app.get("/wbuy/estoque-grade")
@@ -386,7 +411,6 @@ def estoque_grade():
         min_qty = to_int(request.args.get("min_qty", 0), 0)
         page_size = to_int(request.args.get("page_size", 200), 200)
 
-        # padrão: ativos + vendáveis (pra tráfego)
         only_active = request.args.get("only_active", "1") in ("1", "true", "True")
         only_sale = request.args.get("only_sale", "1") in ("1", "true", "True")
 
@@ -432,7 +456,6 @@ def estoque_grade():
         return safe_error(str(e), 500, {"trace": traceback.format_exc()})
 
 
-# ===== ROTA ANTIGA (MANTIDA 100% IGUAL) =====
 @app.get("/wbuy/skus")
 def wbuy_skus():
     try:
@@ -443,10 +466,6 @@ def wbuy_skus():
         return safe_error(str(e), 500, {"trace": traceback.format_exc()})
 
 
-# ===== NOVA ROTA (para o seu main.js) =====
-# URL: /wbuy/skus/ativos
-# Retorna ativos + vendáveis (igual padrão do estoque-grade)
-# Tem cache de 10min pra não travar e não chamar WBuy toda hora
 @app.get("/wbuy/skus/ativos")
 def wbuy_skus_ativos():
     try:
@@ -467,15 +486,13 @@ def wbuy_skus_ativos():
         return safe_error(str(e), 500, {"trace": traceback.format_exc()})
 
 
-# ===== ROTA EXTRA (opcional) só pra teste rápido =====
-# Não muda nada em outros sistemas.
 @app.get("/wbuy/skus/ativos-fast")
 def wbuy_skus_ativos_fast():
     try:
         page_size = to_int(request.args.get("page_size", 200), 200)
-        # só 1 página (offset 0), pra testar sem travar
         data = wbuy_get("/product/stock/", params={"limit": f"0,{page_size}"})
         items = data.get("data") or []
+
         out = []
         for it in items:
             row = normalize_stock_item(it)
@@ -495,16 +512,64 @@ def wbuy_skus_ativos_fast():
 # ================== NOVAS ROTAS DE PEDIDOS ===============
 # =========================================================
 
-# rota principal:
-# traz pedidos da WBuy, tenta filtrar por status e também filtra localmente por J&T
+@app.get("/wbuy/pedidos/formas-envio")
+def wbuy_pedidos_formas_envio():
+    try:
+        page_size = to_int(request.args.get("page_size", 100), 100)
+        max_pages = to_int(request.args.get("max_pages", 20), 20)
+        status_param = (request.args.get("status") or "").strip().lower()
+
+        raw_items, total_api = paginate_orders(
+            page_size=page_size,
+            sleep_ms=0,
+            status_filter=status_param if status_param else None,
+            max_pages=max_pages
+        )
+
+        mapa = {}
+
+        for it in raw_items:
+            row = normalize_order_item(it)
+
+            forma_envio = (row.get("forma_envio") or "").strip()
+            transportadora = (row.get("transportadora") or "").strip()
+            status = (row.get("status") or "").strip()
+
+            chave = f"{forma_envio}|||{transportadora}|||{status}"
+
+            if chave not in mapa:
+                mapa[chave] = {
+                    "forma_envio": forma_envio,
+                    "transportadora": transportadora,
+                    "status": status,
+                    "quantidade": 0,
+                    "exemplo_pedido": row.get("numero", ""),
+                    "codigo_rastreio": row.get("codigo_rastreio", "")
+                }
+
+            mapa[chave]["quantidade"] += 1
+
+        data = sorted(
+            mapa.values(),
+            key=lambda x: (-x["quantidade"], x["forma_envio"], x["transportadora"])
+        )
+
+        return jsonify({
+            "ok": True,
+            "total_api": total_api,
+            "total_formas": len(data),
+            "data": data
+        })
+
+    except Exception as e:
+        return safe_error(str(e), 500, {"trace": traceback.format_exc()})
+
+
 @app.get("/wbuy/pedidos/jt")
 def wbuy_pedidos_jt():
     try:
         page_size = to_int(request.args.get("page_size", 100), 100)
         max_pages = to_int(request.args.get("max_pages", 20), 20)
-
-        # valor padrão: "nota fiscal emitida"
-        # se a WBuy não aceitar esse texto exatamente, o filtro local ainda ajuda
         status_param = (request.args.get("status") or "nota fiscal emitida").strip().lower()
 
         cache_key = f"pedidos_jt_ps{page_size}_mp{max_pages}_st{status_param}"
@@ -523,11 +588,8 @@ def wbuy_pedidos_jt():
         for it in raw_items:
             row = normalize_order_item(it)
 
-            status_txt = (row.get("status") or "").strip().lower()
-            if status_param:
-                # filtro local de segurança
-                if status_param not in status_txt:
-                    continue
+            if not row_matches_status(row, status_param):
+                continue
 
             if not contains_jt_shipping(it, row):
                 continue
@@ -544,6 +606,7 @@ def wbuy_pedidos_jt():
             "total": len(out),
             "data": out
         }
+
         cache_set(cache_key, payload)
         return jsonify(payload)
 
@@ -551,8 +614,6 @@ def wbuy_pedidos_jt():
         return safe_error(str(e), 500, {"trace": traceback.format_exc()})
 
 
-# rota rápida:
-# busca só a primeira página e filtra localmente
 @app.get("/wbuy/pedidos/jt-fast")
 def wbuy_pedidos_jt_fast():
     try:
@@ -566,8 +627,7 @@ def wbuy_pedidos_jt_fast():
         for it in items:
             row = normalize_order_item(it)
 
-            status_txt = (row.get("status") or "").strip().lower()
-            if status_param and status_param not in status_txt:
+            if not row_matches_status(row, status_param):
                 continue
 
             if not contains_jt_shipping(it, row):
