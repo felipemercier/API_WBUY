@@ -17,6 +17,7 @@ TIMEOUT = 30
 
 # ===== Cache simples em memória (não afeta rotas antigas) =====
 CACHE = {}
+
 def cache_get(key, ttl_sec=600):
     item = CACHE.get(key)
     if not item:
@@ -130,6 +131,239 @@ def paginate_stock(page_size=200, sleep_ms=0, only_active=False, only_sale=False
 
         offset += page_size
         if total and offset >= total:
+            break
+
+        if sleep_ms and sleep_ms > 0:
+            time.sleep(sleep_ms / 1000.0)
+
+    return out, total or len(out)
+
+
+# =========================================================
+# ================ NOVAS FUNÇÕES DE PEDIDOS ===============
+# =========================================================
+
+def get_nested(obj, path, default=""):
+    try:
+        cur = obj
+        for p in path:
+            if not isinstance(cur, dict):
+                return default
+            cur = cur.get(p)
+        return cur if cur is not None else default
+    except Exception:
+        return default
+
+
+def normalize_order_item(item):
+    cliente_obj = item.get("cliente") or item.get("customer") or {}
+    endereco_obj = item.get("endereco_entrega") or item.get("shipping_address") or {}
+    transporte_obj = item.get("transporte") or item.get("frete") or item.get("shipping") or {}
+
+    pedido_id = (
+        item.get("pedido_id")
+        or item.get("id")
+        or item.get("order_id")
+        or item.get("codigo")
+        or ""
+    )
+
+    numero = (
+        item.get("numero")
+        or item.get("identificacao")
+        or item.get("pedido")
+        or item.get("order_number")
+        or pedido_id
+        or ""
+    )
+
+    cliente_nome = (
+        get_nested(item, ["cliente", "nome"], "")
+        or get_nested(item, ["customer", "name"], "")
+        or item.get("cliente")
+        or item.get("customer_name")
+        or ""
+    )
+
+    status = (
+        item.get("status")
+        or item.get("status_descricao")
+        or item.get("situacao")
+        or item.get("order_status")
+        or ""
+    )
+
+    data_pedido = (
+        item.get("data")
+        or item.get("data_pedido")
+        or item.get("created_at")
+        or item.get("date_created")
+        or ""
+    )
+
+    valor_total = (
+        item.get("total")
+        or item.get("valor_total")
+        or item.get("total_venda")
+        or item.get("order_total")
+        or ""
+    )
+
+    forma_envio = (
+        item.get("forma_envio")
+        or item.get("servico_frete")
+        or item.get("tipo_frete")
+        or item.get("shipping_method")
+        or get_nested(transporte_obj, ["nome"], "")
+        or get_nested(transporte_obj, ["servico"], "")
+        or get_nested(transporte_obj, ["descricao"], "")
+        or ""
+    )
+
+    transportadora = (
+        item.get("transportadora")
+        or item.get("nome_transportadora")
+        or get_nested(transporte_obj, ["transportadora"], "")
+        or get_nested(transporte_obj, ["nome"], "")
+        or ""
+    )
+
+    codigo_rastreio = (
+        item.get("codigo_rastreio")
+        or item.get("rastreamento")
+        or item.get("tracking")
+        or item.get("tracking_code")
+        or get_nested(transporte_obj, ["codigo_rastreio"], "")
+        or get_nested(transporte_obj, ["tracking"], "")
+        or ""
+    )
+
+    cpf_cnpj = (
+        get_nested(item, ["cliente", "cpf_cnpj"], "")
+        or get_nested(item, ["cliente", "cpf"], "")
+        or get_nested(item, ["customer", "document"], "")
+        or ""
+    )
+
+    email = (
+        get_nested(item, ["cliente", "email"], "")
+        or get_nested(item, ["customer", "email"], "")
+        or ""
+    )
+
+    telefone = (
+        get_nested(item, ["cliente", "telefone"], "")
+        or get_nested(item, ["cliente", "celular"], "")
+        or get_nested(item, ["customer", "phone"], "")
+        or ""
+    )
+
+    cidade = (
+        endereco_obj.get("cidade")
+        or endereco_obj.get("city")
+        or ""
+    )
+
+    uf = (
+        endereco_obj.get("estado")
+        or endereco_obj.get("uf")
+        or endereco_obj.get("state")
+        or ""
+    )
+
+    return {
+        "pedido_id": str(pedido_id),
+        "numero": str(numero),
+        "cliente": str(cliente_nome),
+        "status": str(status),
+        "data": str(data_pedido),
+        "valor_total": valor_total,
+        "forma_envio": str(forma_envio),
+        "transportadora": str(transportadora),
+        "codigo_rastreio": str(codigo_rastreio),
+        "cpf_cnpj": str(cpf_cnpj),
+        "email": str(email),
+        "telefone": str(telefone),
+        "cidade": str(cidade),
+        "uf": str(uf),
+        "raw": item
+    }
+
+
+def contains_jt_shipping(item, normalized_row=None):
+    row = normalized_row or normalize_order_item(item)
+
+    chunks = [
+        row.get("forma_envio", ""),
+        row.get("transportadora", ""),
+        row.get("codigo_rastreio", ""),
+        str(item)
+    ]
+    txt = " ".join(chunks).lower()
+
+    needles = [
+        "j&t",
+        "j&t express",
+        "jt express",
+        "jtexpress",
+        "jt-",
+        "jt_",
+        "jt ez",
+        "jt-ez",
+        "jet",
+        "expresso comum"
+    ]
+
+    return any(n in txt for n in needles)
+
+
+def extract_order_list(data):
+    if isinstance(data, dict):
+        if isinstance(data.get("data"), list):
+            return data.get("data")
+        if isinstance(data.get("orders"), list):
+            return data.get("orders")
+        if isinstance(data.get("pedidos"), list):
+            return data.get("pedidos")
+        if isinstance(data.get("result"), list):
+            return data.get("result")
+    if isinstance(data, list):
+        return data
+    return []
+
+
+def paginate_orders(page_size=100, sleep_ms=0, status_filter=None, max_pages=20):
+    offset = 0
+    total = None
+    out = []
+    pages = 0
+
+    while True:
+        params = {"limit": f"{offset},{page_size}"}
+
+        # se a conta aceitar o filtro por status, melhor.
+        # se não aceitar, ainda vamos filtrar localmente depois.
+        if status_filter:
+            params["status"] = status_filter
+
+        data = wbuy_get("/order/", params=params)
+
+        if total is None:
+            total = to_int(data.get("total", 0), 0)
+
+        items = extract_order_list(data)
+        if not items:
+            break
+
+        out.extend(items)
+
+        offset += page_size
+        pages += 1
+
+        if total and offset >= total:
+            break
+
+        if max_pages and pages >= max_pages:
             break
 
         if sleep_ms and sleep_ms > 0:
@@ -252,6 +486,104 @@ def wbuy_skus_ativos_fast():
             out.append(row)
 
         return jsonify({"ok": True, "total": len(out), "data": out})
+
+    except Exception as e:
+        return safe_error(str(e), 500, {"trace": traceback.format_exc()})
+
+
+# =========================================================
+# ================== NOVAS ROTAS DE PEDIDOS ===============
+# =========================================================
+
+# rota principal:
+# traz pedidos da WBuy, tenta filtrar por status e também filtra localmente por J&T
+@app.get("/wbuy/pedidos/jt")
+def wbuy_pedidos_jt():
+    try:
+        page_size = to_int(request.args.get("page_size", 100), 100)
+        max_pages = to_int(request.args.get("max_pages", 20), 20)
+
+        # valor padrão: "nota fiscal emitida"
+        # se a WBuy não aceitar esse texto exatamente, o filtro local ainda ajuda
+        status_param = (request.args.get("status") or "nota fiscal emitida").strip().lower()
+
+        cache_key = f"pedidos_jt_ps{page_size}_mp{max_pages}_st{status_param}"
+        cached = cache_get(cache_key, ttl_sec=180)
+        if cached:
+            return jsonify(cached)
+
+        raw_items, total_api = paginate_orders(
+            page_size=page_size,
+            sleep_ms=0,
+            status_filter=status_param,
+            max_pages=max_pages
+        )
+
+        out = []
+        for it in raw_items:
+            row = normalize_order_item(it)
+
+            status_txt = (row.get("status") or "").strip().lower()
+            if status_param:
+                # filtro local de segurança
+                if status_param not in status_txt:
+                    continue
+
+            if not contains_jt_shipping(it, row):
+                continue
+
+            out.append(row)
+
+        payload = {
+            "ok": True,
+            "filtro": {
+                "status": status_param,
+                "transportadora": "J&T"
+            },
+            "total_api": total_api,
+            "total": len(out),
+            "data": out
+        }
+        cache_set(cache_key, payload)
+        return jsonify(payload)
+
+    except Exception as e:
+        return safe_error(str(e), 500, {"trace": traceback.format_exc()})
+
+
+# rota rápida:
+# busca só a primeira página e filtra localmente
+@app.get("/wbuy/pedidos/jt-fast")
+def wbuy_pedidos_jt_fast():
+    try:
+        page_size = to_int(request.args.get("page_size", 100), 100)
+        status_param = (request.args.get("status") or "nota fiscal emitida").strip().lower()
+
+        data = wbuy_get("/order/", params={"limit": f"0,{page_size}"})
+        items = extract_order_list(data)
+
+        out = []
+        for it in items:
+            row = normalize_order_item(it)
+
+            status_txt = (row.get("status") or "").strip().lower()
+            if status_param and status_param not in status_txt:
+                continue
+
+            if not contains_jt_shipping(it, row):
+                continue
+
+            out.append(row)
+
+        return jsonify({
+            "ok": True,
+            "filtro": {
+                "status": status_param,
+                "transportadora": "J&T"
+            },
+            "total": len(out),
+            "data": out
+        })
 
     except Exception as e:
         return safe_error(str(e), 500, {"trace": traceback.format_exc()})
