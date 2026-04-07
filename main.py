@@ -77,7 +77,6 @@ def wbuy_get(path, params=None):
     rc = str(data.get("responseCode", ""))
     code = str(data.get("code", ""))
 
-    # aceita formatos comuns de sucesso
     if rc not in ("200", "201", "") and code not in ("010", "1", ""):
         raise RuntimeError(f"WBuy erro: {data}")
 
@@ -508,10 +507,6 @@ def wbuy_skus_ativos_fast():
         return safe_error(str(e), 500, {"trace": traceback.format_exc()})
 
 
-# =========================================================
-# ================== NOVAS ROTAS DE PEDIDOS ===============
-# =========================================================
-
 @app.get("/wbuy/pedidos/formas-envio")
 def wbuy_pedidos_formas_envio():
     try:
@@ -656,18 +651,13 @@ def wbuy_produtos():
         page_size = to_int(request.args.get("page_size", 200), 200)
         max_pages = to_int(request.args.get("max_pages", 20), 20)
 
-        cache_key = f"wbuy_produtos_q{q}_ps{page_size}_mp{max_pages}"
-        cached = cache_get(cache_key, ttl_sec=300)
-        if cached:
-            return jsonify(cached)
-
         offset = 0
         total_api = 0
         pages = 0
         out = []
 
         while True:
-            data = wbuy_get("/product/", params={"limit": f"{offset},{page_size}"})
+            data = wbuy_get("/product/stock/", params={"limit": f"{offset},{page_size}"})
 
             if not total_api:
                 total_api = to_int(data.get("total", 0), 0)
@@ -677,45 +667,49 @@ def wbuy_produtos():
                 break
 
             for item in items:
-                produto_id = str(item.get("id") or "").strip()
+                produto_obj = item.get("produto") or {}
+                variacao = item.get("variacao") or {}
+                cor = item.get("cor") or {}
 
-                nome = str(
-                    item.get("produto")
-                    or item.get("name")
-                    or item.get("titulo")
-                    or ""
+                nome_produto = str(
+                    produto_obj.get("produto")
+                    or produto_obj.get("nome")
+                    or item.get("produto_nome")
+                    or "SEM NOME"
                 ).strip()
 
-                sku = str(
-                    item.get("sku")
-                    or item.get("codigo")
-                    or item.get("cod")
-                    or ""
-                ).strip()
+                cor_nome = str(cor.get("nome") or "").strip()
+                valor_variacao = str(variacao.get("valor") or variacao.get("nome") or "").strip()
 
-                gtin = str(
-                    item.get("gtin")
-                    or item.get("barcode")
-                    or item.get("ean")
-                    or ""
-                ).strip()
+                partes_nome = [nome_produto]
+                if cor_nome and cor_nome != ".":
+                    partes_nome.append(cor_nome)
+                if valor_variacao:
+                    partes_nome.append(valor_variacao)
 
-                codigo_barras = gtin if gtin else sku
+                nome_completo = " ".join(partes_nome).strip()
 
-                texto_busca = f"{produto_id} {nome} {sku} {gtin} {codigo_barras}".lower()
+                id_variacao = str(item.get("id") or "").strip()
+                codigo_variacao = str(item.get("cod_estoque") or item.get("erp_id") or "").strip()
+                sku = str(item.get("sku") or "").strip()
+                gtin = str(item.get("gtin") or "").strip()
+
+                texto_busca = f"{id_variacao} {codigo_variacao} {sku} {gtin} {nome_completo} {valor_variacao}".lower()
 
                 if q and q not in texto_busca:
                     continue
 
-                if not nome:
+                if not codigo_variacao:
                     continue
 
                 out.append({
-                    "id": produto_id,
-                    "nome": nome,
+                    "id": id_variacao,
+                    "nome": nome_completo,
+                    "variacao": valor_variacao,
+                    "codigo_variacao": codigo_variacao,
                     "sku": sku,
                     "gtin": gtin,
-                    "codigo_barras": codigo_barras
+                    "codigo_barras": codigo_variacao
                 })
 
             offset += page_size
@@ -727,15 +721,12 @@ def wbuy_produtos():
             if max_pages and pages >= max_pages:
                 break
 
-        payload = {
+        return jsonify({
             "ok": True,
             "total_api": total_api,
             "total_produtos": len(out),
             "produtos": out
-        }
-
-        cache_set(cache_key, payload)
-        return jsonify(payload)
+        })
 
     except Exception as e:
         return safe_error(str(e), 500, {"trace": traceback.format_exc()})
