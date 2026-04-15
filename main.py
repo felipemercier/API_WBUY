@@ -732,6 +732,50 @@ def wbuy_produtos():
         return safe_error(str(e), 500, {"trace": traceback.format_exc()})
 
 
+# =========================================================
+# =================== NOVA ROTA ADICIONADA ================
+# =========================================================
+@app.get("/wbuy/estoque")
+def estoque_simples():
+    try:
+        cache_key = "estoque_simples"
+        cached = cache_get(cache_key, 300)
+
+        if cached:
+            return jsonify({
+                "ok": True,
+                "total": len(cached),
+                "data": cached
+            })
+
+        itens, total = paginate_stock(
+            page_size=200,
+            sleep_ms=50,
+            only_active=True,
+            only_sale=True
+        )
+
+        simples = [{
+            "sku": i["sku"],
+            "produto": i["produto"],
+            "tamanho": i["tamanho"],
+            "cor": i["cor"],
+            "estoque": i["qty"]
+        } for i in itens]
+
+        cache_set(cache_key, simples)
+
+        return jsonify({
+            "ok": True,
+            "total": total,
+            "data": simples
+        })
+
+    except Exception as e:
+        traceback.print_exc()
+        return safe_error("Erro ao buscar estoque", extra={"detail": str(e)})
+
+
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "10000"))
     app.run(host="0.0.0.0", port=port, debug=False)
