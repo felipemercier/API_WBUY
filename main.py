@@ -776,6 +776,219 @@ def estoque_simples():
         return safe_error("Erro ao buscar estoque", extra={"detail": str(e)})
 
 
+# =========================================================
+# ====================== CRM WHATSAPP ======================
+# =========================================================
+
+def apenas_numeros(valor):
+    return "".join(c for c in str(valor or "") if c.isdigit())
+
+
+def normalizar_telefone(valor):
+    telefone = apenas_numeros(valor)
+
+    if telefone.startswith("55") and len(telefone) > 11:
+        telefone = telefone[2:]
+
+    return telefone
+
+
+def telefones_compativeis(telefone_a, telefone_b):
+    a = normalizar_telefone(telefone_a)
+    b = normalizar_telefone(telefone_b)
+
+    if not a or not b:
+        return False
+
+    if a == b:
+        return True
+
+    if len(a) >= 10 and len(b) >= 10:
+        if a[-10:] == b[-10:]:
+            return True
+
+        if len(a) >= 11 and len(b) >= 11 and a[-11:] == b[-11:]:
+            return True
+
+    return False
+
+
+def valor_float(valor):
+    if valor is None:
+        return 0.0
+
+    if isinstance(valor, (int, float)):
+        return float(valor)
+
+    texto = str(valor).strip()
+
+    if not texto:
+        return 0.0
+
+    texto = texto.replace("R$", "").replace(" ", "")
+
+    if "," in texto and "." in texto:
+        texto = texto.replace(".", "").replace(",", ".")
+    elif "," in texto:
+        texto = texto.replace(",", ".")
+
+    try:
+        return float(texto)
+    except Exception:
+        return 0.0
+
+
+def ordenar_pedidos_por_data(pedidos):
+    def chave(pedido):
+        return str(pedido.get("data") or "")
+
+    return sorted(pedidos, key=chave, reverse=True)
+
+
+@app.get("/crm/cliente")
+def crm_cliente():
+    try:
+        telefone_busca = request.args.get("telefone", "").strip()
+
+        if not telefone_busca:
+            return safe_error(
+                "Informe o telefone usando ?telefone=27999999999",
+                400
+            )
+
+        telefone_normalizado = normalizar_telefone(telefone_busca)
+
+        if len(telefone_normalizado) < 10:
+            return safe_error("Telefone inválido.", 400)
+
+        page_size = to_int(request.args.get("page_size", 100), 100)
+        max_pages = to_int(request.args.get("max_pages", 20), 20)
+
+        page_size = max(1, min(page_size, 200))
+        max_pages = max(1, min(max_pages, 100))
+
+        cache_key = (
+            f"crm_cliente_"
+            f"{telefone_normalizado}_"
+            f"{page_size}_"
+            f"{max_pages}"
+        )
+
+        cached = cache_get(cache_key, ttl_sec=180)
+
+        if cached:
+            return jsonify(cached)
+
+        raw_items, total_api = paginate_orders(
+            page_size=page_size,
+            sleep_ms=0,
+            status_filter=None,
+            max_pages=max_pages
+        )
+
+        pedidos_encontrados = []
+
+        for item in raw_items:
+            pedido = normalize_order_item(item)
+
+            if telefones_compativeis(
+                pedido.get("telefone"),
+                telefone_normalizado
+            ):
+                pedidos_encontrados.append(pedido)
+
+        pedidos_encontrados = ordenar_pedidos_por_data(
+            pedidos_encontrados
+        )
+
+        if not pedidos_encontrados:
+            payload = {
+                "ok": True,
+                "encontrado": False,
+                "telefone_consultado": telefone_normalizado,
+                "total_pedidos_api_consultados": len(raw_items),
+                "total_api": total_api,
+                "cliente": None,
+                "estatisticas": {
+                    "quantidade_pedidos": 0,
+                    "valor_total": 0.0,
+                    "ticket_medio": 0.0
+                },
+                "ultimo_pedido": None,
+                "pedidos": []
+            }
+
+            cache_set(cache_key, payload)
+            return jsonify(payload)
+
+        ultimo_pedido_completo = pedidos_encontrados[0]
+
+        valor_total = sum(
+            valor_float(pedido.get("valor_total"))
+            for pedido in pedidos_encontrados
+        )
+
+        quantidade_pedidos = len(pedidos_encontrados)
+        ticket_medio = (
+            valor_total / quantidade_pedidos
+            if quantidade_pedidos
+            else 0.0
+        )
+
+        cliente = {
+            "nome": ultimo_pedido_completo.get("cliente", ""),
+            "telefone": ultimo_pedido_completo.get("telefone", ""),
+            "email": ultimo_pedido_completo.get("email", ""),
+            "cpf_cnpj": ultimo_pedido_completo.get("cpf_cnpj", ""),
+            "cidade": ultimo_pedido_completo.get("cidade", ""),
+            "uf": ultimo_pedido_completo.get("uf", "")
+        }
+
+        pedidos_resumidos = []
+
+        for pedido in pedidos_encontrados[:10]:
+            pedidos_resumidos.append({
+                "pedido_id": pedido.get("pedido_id", ""),
+                "numero": pedido.get("numero", ""),
+                "status": pedido.get("status", ""),
+                "data": pedido.get("data", ""),
+                "valor_total": pedido.get("valor_total", ""),
+                "forma_envio": pedido.get("forma_envio", ""),
+                "transportadora": pedido.get("transportadora", ""),
+                "codigo_rastreio": pedido.get("codigo_rastreio", ""),
+                "rastreio_url": pedido.get("rastreio_url", ""),
+                "prazo": pedido.get("prazo", "")
+            })
+
+        payload = {
+            "ok": True,
+            "encontrado": True,
+            "telefone_consultado": telefone_normalizado,
+            "total_pedidos_api_consultados": len(raw_items),
+            "total_api": total_api,
+            "cliente": cliente,
+            "estatisticas": {
+                "quantidade_pedidos": quantidade_pedidos,
+                "valor_total": round(valor_total, 2),
+                "ticket_medio": round(ticket_medio, 2)
+            },
+            "ultimo_pedido": pedidos_resumidos[0],
+            "pedidos": pedidos_resumidos
+        }
+
+        cache_set(cache_key, payload)
+        return jsonify(payload)
+
+    except Exception as e:
+        return safe_error(
+            "Erro ao consultar cliente no CRM.",
+            500,
+            {
+                "detail": str(e),
+                "trace": traceback.format_exc()
+            }
+        )
+
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "10000"))
     app.run(host="0.0.0.0", port=port, debug=False)
