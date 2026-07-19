@@ -804,40 +804,15 @@ def extract_customer_list(data):
 
 
 def paginate_customers(page_size=200, sleep_ms=0, max_pages=50):
-    offset = 0
-    total = None
-    out = []
-    pages = 0
+    # O endpoint /customer/ da WBuy já retorna a lista completa.
+    # Não enviamos "limit", porque esse parâmetro não é necessário
+    # e pode não ser aceito nessa rota.
+    data = wbuy_get("/customer/")
 
-    while True:
-        data = wbuy_get(
-            "/customer/",
-            params={"limit": f"{offset},{page_size}"}
-        )
+    items = extract_customer_list(data)
+    total = to_int(data.get("total", len(items)), len(items))
 
-        if total is None:
-            total = to_int(data.get("total", 0), 0)
-
-        items = extract_customer_list(data)
-
-        if not items:
-            break
-
-        out.extend(items)
-
-        offset += page_size
-        pages += 1
-
-        if total and offset >= total:
-            break
-
-        if max_pages and pages >= max_pages:
-            break
-
-        if sleep_ms and sleep_ms > 0:
-            time.sleep(sleep_ms / 1000.0)
-
-    return out, total or len(out)
+    return items, total
 
 
 def normalize_customer_item(item):
@@ -875,7 +850,7 @@ def normalize_customer_item(item):
 def buscar_cliente_wbuy_por_telefone(telefone, page_size=200, max_pages=50):
     telefone_normalizado = normalizar_telefone(telefone)
 
-    cache_key = f"cliente_wbuy_tel_{telefone_normalizado}"
+    cache_key = f"cliente_wbuy_tel_v3_{telefone_normalizado}"
     cached = cache_get(cache_key, ttl_sec=600)
 
     if cached is not None:
@@ -1045,7 +1020,7 @@ def crm_cliente():
         order_max_pages = max(1, min(order_max_pages, 100))
 
         cache_key = (
-            f"crm_cliente_v2_{telefone_normalizado}_"
+            f"crm_cliente_v3_{telefone_normalizado}_"
             f"{customer_page_size}_{customer_max_pages}_"
             f"{order_page_size}_{order_max_pages}"
         )
