@@ -318,9 +318,18 @@ def normalize_order_item(item):
 
     telefone = (
         get_nested(item, ["cliente", "telefone"], "")
+        or get_nested(item, ["cliente", "telefone1"], "")
+        or get_nested(item, ["cliente", "telefone2"], "")
+        or get_nested(item, ["cliente", "telefone3"], "")
         or get_nested(item, ["cliente", "celular"], "")
         or get_nested(item, ["cliente", "fone"], "")
         or get_nested(item, ["customer", "phone"], "")
+        or get_nested(item, ["customer", "phone1"], "")
+        or get_nested(item, ["customer", "phone2"], "")
+        or get_nested(item, ["customer", "phone3"], "")
+        or item.get("telefone1")
+        or item.get("telefone2")
+        or item.get("telefone3")
         or ""
     )
 
@@ -776,6 +785,158 @@ def estoque_simples():
         return safe_error("Erro ao buscar estoque", extra={"detail": str(e)})
 
 
+
+# =========================================================
+# ==================== CLIENTES WBUY =======================
+# =========================================================
+
+def extract_customer_list(data):
+    if isinstance(data, dict):
+        for key in ("data", "customers", "clientes", "result"):
+            value = data.get(key)
+            if isinstance(value, list):
+                return value
+
+    if isinstance(data, list):
+        return data
+
+    return []
+
+
+def paginate_customers(page_size=200, sleep_ms=0, max_pages=50):
+    offset = 0
+    total = None
+    out = []
+    pages = 0
+
+    while True:
+        data = wbuy_get(
+            "/customer/",
+            params={"limit": f"{offset},{page_size}"}
+        )
+
+        if total is None:
+            total = to_int(data.get("total", 0), 0)
+
+        items = extract_customer_list(data)
+
+        if not items:
+            break
+
+        out.extend(items)
+
+        offset += page_size
+        pages += 1
+
+        if total and offset >= total:
+            break
+
+        if max_pages and pages >= max_pages:
+            break
+
+        if sleep_ms and sleep_ms > 0:
+            time.sleep(sleep_ms / 1000.0)
+
+    return out, total or len(out)
+
+
+def normalize_customer_item(item):
+    enderecos = item.get("enderecos") or []
+    endereco = enderecos[0] if enderecos and isinstance(enderecos[0], dict) else {}
+
+    telefones = [
+        item.get("telefone1") or "",
+        item.get("telefone2") or "",
+        item.get("telefone3") or "",
+    ]
+
+    telefone_principal = next(
+        (t for t in telefones if str(t).strip()),
+        ""
+    )
+
+    return {
+        "id": str(item.get("id") or ""),
+        "nome": str(item.get("nome") or ""),
+        "email": str(item.get("email") or ""),
+        "cpf_cnpj": str(item.get("doc1") or ""),
+        "telefone": str(telefone_principal),
+        "telefones": [str(t) for t in telefones if str(t).strip()],
+        "cidade": str(item.get("cidade") or endereco.get("cidade") or ""),
+        "uf": str(item.get("uf") or endereco.get("uf") or ""),
+        "tabela_nome": str(item.get("tabela_nome") or ""),
+        "credito_valor": item.get("credito_valor") or "",
+        "pontos": item.get("pontos") or "",
+        "ativo": str(item.get("ativo") or ""),
+        "raw": item
+    }
+
+
+def buscar_cliente_wbuy_por_telefone(telefone, page_size=200, max_pages=50):
+    telefone_normalizado = normalizar_telefone(telefone)
+
+    cache_key = f"cliente_wbuy_tel_{telefone_normalizado}"
+    cached = cache_get(cache_key, ttl_sec=600)
+
+    if cached is not None:
+        return cached
+
+    raw_customers, total_api = paginate_customers(
+        page_size=page_size,
+        sleep_ms=0,
+        max_pages=max_pages
+    )
+
+    for item in raw_customers:
+        cliente = normalize_customer_item(item)
+
+        for telefone_cliente in cliente.get("telefones", []):
+            if telefones_compativeis(
+                telefone_cliente,
+                telefone_normalizado
+            ):
+                resultado = {
+                    "encontrado": True,
+                    "total_api": total_api,
+                    "cliente": cliente
+                }
+                cache_set(cache_key, resultado)
+                return resultado
+
+    resultado = {
+        "encontrado": False,
+        "total_api": total_api,
+        "cliente": None
+    }
+    cache_set(cache_key, resultado)
+    return resultado
+
+
+def pedido_pertence_ao_cliente(pedido, cliente):
+    if not cliente:
+        return False
+
+    if telefones_compativeis(
+        pedido.get("telefone"),
+        cliente.get("telefone")
+    ):
+        return True
+
+    email_pedido = str(pedido.get("email") or "").strip().lower()
+    email_cliente = str(cliente.get("email") or "").strip().lower()
+
+    if email_pedido and email_cliente and email_pedido == email_cliente:
+        return True
+
+    doc_pedido = apenas_numeros(pedido.get("cpf_cnpj"))
+    doc_cliente = apenas_numeros(cliente.get("cpf_cnpj"))
+
+    if doc_pedido and doc_cliente and doc_pedido == doc_cliente:
+        return True
+
+    return False
+
+
 # =========================================================
 # ====================== CRM WHATSAPP ======================
 # =========================================================
@@ -861,53 +1022,51 @@ def crm_cliente():
         if len(telefone_normalizado) < 10:
             return safe_error("Telefone inválido.", 400)
 
-        page_size = to_int(request.args.get("page_size", 100), 100)
-        max_pages = to_int(request.args.get("max_pages", 20), 20)
+        customer_page_size = to_int(
+            request.args.get("customer_page_size", 200),
+            200
+        )
+        customer_max_pages = to_int(
+            request.args.get("customer_max_pages", 50),
+            50
+        )
+        order_page_size = to_int(
+            request.args.get("order_page_size", 100),
+            100
+        )
+        order_max_pages = to_int(
+            request.args.get("order_max_pages", 100),
+            100
+        )
 
-        page_size = max(1, min(page_size, 200))
-        max_pages = max(1, min(max_pages, 100))
+        customer_page_size = max(1, min(customer_page_size, 200))
+        customer_max_pages = max(1, min(customer_max_pages, 100))
+        order_page_size = max(1, min(order_page_size, 200))
+        order_max_pages = max(1, min(order_max_pages, 100))
 
         cache_key = (
-            f"crm_cliente_"
-            f"{telefone_normalizado}_"
-            f"{page_size}_"
-            f"{max_pages}"
+            f"crm_cliente_v2_{telefone_normalizado}_"
+            f"{customer_page_size}_{customer_max_pages}_"
+            f"{order_page_size}_{order_max_pages}"
         )
 
         cached = cache_get(cache_key, ttl_sec=180)
-
         if cached:
             return jsonify(cached)
 
-        raw_items, total_api = paginate_orders(
-            page_size=page_size,
-            sleep_ms=0,
-            status_filter=None,
-            max_pages=max_pages
+        busca_cliente = buscar_cliente_wbuy_por_telefone(
+            telefone_normalizado,
+            page_size=customer_page_size,
+            max_pages=customer_max_pages
         )
 
-        pedidos_encontrados = []
-
-        for item in raw_items:
-            pedido = normalize_order_item(item)
-
-            if telefones_compativeis(
-                pedido.get("telefone"),
-                telefone_normalizado
-            ):
-                pedidos_encontrados.append(pedido)
-
-        pedidos_encontrados = ordenar_pedidos_por_data(
-            pedidos_encontrados
-        )
-
-        if not pedidos_encontrados:
+        if not busca_cliente.get("encontrado"):
             payload = {
                 "ok": True,
                 "encontrado": False,
+                "motivo": "Cliente não localizado no cadastro da WBuy.",
                 "telefone_consultado": telefone_normalizado,
-                "total_pedidos_api_consultados": len(raw_items),
-                "total_api": total_api,
+                "total_clientes_api": busca_cliente.get("total_api", 0),
                 "cliente": None,
                 "estatisticas": {
                     "quantidade_pedidos": 0,
@@ -917,11 +1076,29 @@ def crm_cliente():
                 "ultimo_pedido": None,
                 "pedidos": []
             }
-
             cache_set(cache_key, payload)
             return jsonify(payload)
 
-        ultimo_pedido_completo = pedidos_encontrados[0]
+        cliente_wbuy = busca_cliente.get("cliente")
+
+        raw_items, total_orders_api = paginate_orders(
+            page_size=order_page_size,
+            sleep_ms=0,
+            status_filter=None,
+            max_pages=order_max_pages
+        )
+
+        pedidos_encontrados = []
+
+        for item in raw_items:
+            pedido = normalize_order_item(item)
+
+            if pedido_pertence_ao_cliente(pedido, cliente_wbuy):
+                pedidos_encontrados.append(pedido)
+
+        pedidos_encontrados = ordenar_pedidos_por_data(
+            pedidos_encontrados
+        )
 
         valor_total = sum(
             valor_float(pedido.get("valor_total"))
@@ -934,15 +1111,6 @@ def crm_cliente():
             if quantidade_pedidos
             else 0.0
         )
-
-        cliente = {
-            "nome": ultimo_pedido_completo.get("cliente", ""),
-            "telefone": ultimo_pedido_completo.get("telefone", ""),
-            "email": ultimo_pedido_completo.get("email", ""),
-            "cpf_cnpj": ultimo_pedido_completo.get("cpf_cnpj", ""),
-            "cidade": ultimo_pedido_completo.get("cidade", ""),
-            "uf": ultimo_pedido_completo.get("uf", "")
-        }
 
         pedidos_resumidos = []
 
@@ -960,19 +1128,37 @@ def crm_cliente():
                 "prazo": pedido.get("prazo", "")
             })
 
+        cliente_publico = {
+            "id": cliente_wbuy.get("id", ""),
+            "nome": cliente_wbuy.get("nome", ""),
+            "telefone": cliente_wbuy.get("telefone", ""),
+            "email": cliente_wbuy.get("email", ""),
+            "cpf_cnpj": cliente_wbuy.get("cpf_cnpj", ""),
+            "cidade": cliente_wbuy.get("cidade", ""),
+            "uf": cliente_wbuy.get("uf", ""),
+            "tabela_nome": cliente_wbuy.get("tabela_nome", ""),
+            "credito_valor": cliente_wbuy.get("credito_valor", ""),
+            "pontos": cliente_wbuy.get("pontos", "")
+        }
+
         payload = {
             "ok": True,
             "encontrado": True,
             "telefone_consultado": telefone_normalizado,
+            "total_clientes_api": busca_cliente.get("total_api", 0),
+            "total_pedidos_api": total_orders_api,
             "total_pedidos_api_consultados": len(raw_items),
-            "total_api": total_api,
-            "cliente": cliente,
+            "cliente": cliente_publico,
             "estatisticas": {
                 "quantidade_pedidos": quantidade_pedidos,
                 "valor_total": round(valor_total, 2),
                 "ticket_medio": round(ticket_medio, 2)
             },
-            "ultimo_pedido": pedidos_resumidos[0],
+            "ultimo_pedido": (
+                pedidos_resumidos[0]
+                if pedidos_resumidos
+                else None
+            ),
             "pedidos": pedidos_resumidos
         }
 
