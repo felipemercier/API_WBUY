@@ -197,7 +197,7 @@ def paginate_orders(page_size=100, sleep_ms=0, status_filter=None, max_pages=20)
 
         out.extend(items)
 
-        offset += page_size
+        offset += len(items)
         pages += 1
 
         if total and offset >= total:
@@ -242,13 +242,23 @@ def normalize_order_item(item):
         or ""
     )
 
-    status = (
-        item.get("status")
-        or item.get("status_descricao")
-        or item.get("situacao")
-        or item.get("order_status")
-        or ""
-    )
+    status_obj = item.get("status") or {}
+
+    if isinstance(status_obj, dict):
+        status = (
+            status_obj.get("nome")
+            or status_obj.get("status_nome")
+            or status_obj.get("descricao")
+            or ""
+        )
+    else:
+        status = (
+            status_obj
+            or item.get("status_descricao")
+            or item.get("situacao")
+            or item.get("order_status")
+            or ""
+        )
 
     data_pedido = (
         item.get("data")
@@ -258,13 +268,23 @@ def normalize_order_item(item):
         or ""
     )
 
-    valor_total = (
-        item.get("total")
-        or item.get("valor_total")
+    valor_obj = (
+        item.get("valor_total")
+        or item.get("total")
         or item.get("total_venda")
         or item.get("order_total")
         or ""
     )
+
+    if isinstance(valor_obj, dict):
+        valor_total = (
+            valor_obj.get("total")
+            or valor_obj.get("valor")
+            or valor_obj.get("subtotal")
+            or 0
+        )
+    else:
+        valor_total = valor_obj
 
     forma_envio = (
         frete_obj.get("nome")
@@ -318,9 +338,15 @@ def normalize_order_item(item):
 
     telefone = (
         get_nested(item, ["cliente", "telefone"], "")
+        or get_nested(item, ["cliente", "telefone1"], "")
+        or get_nested(item, ["cliente", "telefone2"], "")
+        or get_nested(item, ["cliente", "telefone3"], "")
         or get_nested(item, ["cliente", "celular"], "")
         or get_nested(item, ["cliente", "fone"], "")
         or get_nested(item, ["customer", "phone"], "")
+        or get_nested(item, ["customer", "phone1"], "")
+        or get_nested(item, ["customer", "phone2"], "")
+        or get_nested(item, ["customer", "phone3"], "")
         or ""
     )
 
@@ -356,6 +382,12 @@ def normalize_order_item(item):
         "telefone": str(telefone),
         "cidade": str(cidade),
         "uf": str(uf),
+        "cliente_id": str(
+            get_nested(item, ["cliente", "id"], "")
+            or get_nested(item, ["customer", "id"], "")
+            or ""
+        ),
+        "produtos": item.get("produtos") if isinstance(item.get("produtos"), list) else [],
         "raw": item
     }
 
@@ -845,8 +877,9 @@ def ordenar_pedidos_por_data(pedidos):
     return sorted(pedidos, key=chave, reverse=True)
 
 
+@app.get("/crm/cliente-pedidos")
 @app.get("/crm/cliente")
-def crm_cliente():
+def crm_cliente_pedidos():
     try:
         telefone_busca = request.args.get("telefone", "").strip()
 
@@ -861,119 +894,107 @@ def crm_cliente():
         if len(telefone_normalizado) < 10:
             return safe_error("Telefone inválido.", 400)
 
-        page_size = to_int(request.args.get("page_size", 100), 100)
-        max_pages = to_int(request.args.get("max_pages", 20), 20)
+        offset = to_int(request.args.get("offset", 0), 0)
+        page_size = to_int(request.args.get("limit", 100), 100)
 
+        offset = max(0, offset)
         page_size = max(1, min(page_size, 200))
-        max_pages = max(1, min(max_pages, 100))
 
         cache_key = (
-            f"crm_cliente_"
+            f"crm_pedidos_lote_v2_"
             f"{telefone_normalizado}_"
-            f"{page_size}_"
-            f"{max_pages}"
+            f"{offset}_"
+            f"{page_size}"
         )
 
         cached = cache_get(cache_key, ttl_sec=180)
-
         if cached:
             return jsonify(cached)
 
-        raw_items, total_api = paginate_orders(
-            page_size=page_size,
-            sleep_ms=0,
-            status_filter=None,
-            max_pages=max_pages
+        data = wbuy_get(
+            "/order/",
+            params={"limit": f"{offset},{page_size}"}
         )
 
-        pedidos_encontrados = []
+        raw_items = extract_order_list(data)
+        total_api = to_int(data.get("total", 0), 0)
+
+        encontrados = []
 
         for item in raw_items:
             pedido = normalize_order_item(item)
 
-            if telefones_compativeis(
+            if not telefones_compativeis(
                 pedido.get("telefone"),
                 telefone_normalizado
             ):
-                pedidos_encontrados.append(pedido)
+                continue
 
-        pedidos_encontrados = ordenar_pedidos_por_data(
-            pedidos_encontrados
-        )
+            produtos_resumidos = []
 
-        if not pedidos_encontrados:
-            payload = {
-                "ok": True,
-                "encontrado": False,
-                "telefone_consultado": telefone_normalizado,
-                "total_pedidos_api_consultados": len(raw_items),
-                "total_api": total_api,
-                "cliente": None,
-                "estatisticas": {
-                    "quantidade_pedidos": 0,
-                    "valor_total": 0.0,
-                    "ticket_medio": 0.0
+            for produto in pedido.get("produtos", []):
+                if not isinstance(produto, dict):
+                    continue
+
+                produtos_resumidos.append({
+                    "produto": produto.get("produto", ""),
+                    "quantidade": to_int(produto.get("qtd", 1), 1),
+                    "cor": produto.get("cor", ""),
+                    "tamanho": produto.get("variacaoValor", ""),
+                    "sku": produto.get("sku", ""),
+                    "valor": produto.get("valor", "")
+                })
+
+            encontrados.append({
+                "cliente": {
+                    "id": pedido.get("cliente_id", ""),
+                    "nome": pedido.get("cliente", ""),
+                    "telefone": pedido.get("telefone", ""),
+                    "email": pedido.get("email", ""),
+                    "cpf_cnpj": pedido.get("cpf_cnpj", ""),
+                    "cidade": pedido.get("cidade", ""),
+                    "uf": pedido.get("uf", "")
                 },
-                "ultimo_pedido": None,
-                "pedidos": []
-            }
-
-            cache_set(cache_key, payload)
-            return jsonify(payload)
-
-        ultimo_pedido_completo = pedidos_encontrados[0]
-
-        valor_total = sum(
-            valor_float(pedido.get("valor_total"))
-            for pedido in pedidos_encontrados
-        )
-
-        quantidade_pedidos = len(pedidos_encontrados)
-        ticket_medio = (
-            valor_total / quantidade_pedidos
-            if quantidade_pedidos
-            else 0.0
-        )
-
-        cliente = {
-            "nome": ultimo_pedido_completo.get("cliente", ""),
-            "telefone": ultimo_pedido_completo.get("telefone", ""),
-            "email": ultimo_pedido_completo.get("email", ""),
-            "cpf_cnpj": ultimo_pedido_completo.get("cpf_cnpj", ""),
-            "cidade": ultimo_pedido_completo.get("cidade", ""),
-            "uf": ultimo_pedido_completo.get("uf", "")
-        }
-
-        pedidos_resumidos = []
-
-        for pedido in pedidos_encontrados[:10]:
-            pedidos_resumidos.append({
-                "pedido_id": pedido.get("pedido_id", ""),
-                "numero": pedido.get("numero", ""),
-                "status": pedido.get("status", ""),
-                "data": pedido.get("data", ""),
-                "valor_total": pedido.get("valor_total", ""),
-                "forma_envio": pedido.get("forma_envio", ""),
-                "transportadora": pedido.get("transportadora", ""),
-                "codigo_rastreio": pedido.get("codigo_rastreio", ""),
-                "rastreio_url": pedido.get("rastreio_url", ""),
-                "prazo": pedido.get("prazo", "")
+                "pedido": {
+                    "pedido_id": pedido.get("pedido_id", ""),
+                    "numero": pedido.get("numero", ""),
+                    "status": pedido.get("status", ""),
+                    "data": pedido.get("data", ""),
+                    "valor_total": round(
+                        valor_float(pedido.get("valor_total")),
+                        2
+                    ),
+                    "forma_envio": pedido.get("forma_envio", ""),
+                    "transportadora": pedido.get("transportadora", ""),
+                    "codigo_rastreio": pedido.get("codigo_rastreio", ""),
+                    "rastreio_url": pedido.get("rastreio_url", ""),
+                    "prazo": pedido.get("prazo", ""),
+                    "produtos": produtos_resumidos
+                }
             })
+
+        proximo_offset = offset + len(raw_items)
+
+        terminou = (
+            len(raw_items) == 0
+            or (
+                total_api > 0
+                and proximo_offset >= total_api
+            )
+        )
 
         payload = {
             "ok": True,
-            "encontrado": True,
+            "versao_crm": "pedidos-lote-v2",
             "telefone_consultado": telefone_normalizado,
-            "total_pedidos_api_consultados": len(raw_items),
+            "offset": offset,
+            "limit": page_size,
+            "recebidos": len(raw_items),
             "total_api": total_api,
-            "cliente": cliente,
-            "estatisticas": {
-                "quantidade_pedidos": quantidade_pedidos,
-                "valor_total": round(valor_total, 2),
-                "ticket_medio": round(ticket_medio, 2)
-            },
-            "ultimo_pedido": pedidos_resumidos[0],
-            "pedidos": pedidos_resumidos
+            "proximo_offset": proximo_offset,
+            "terminou": terminou,
+            "quantidade_encontrada_no_lote": len(encontrados),
+            "encontrados": encontrados
         }
 
         cache_set(cache_key, payload)
@@ -981,13 +1002,24 @@ def crm_cliente():
 
     except Exception as e:
         return safe_error(
-            "Erro ao consultar cliente no CRM.",
+            "Erro ao consultar lote de pedidos do CRM.",
             500,
             {
                 "detail": str(e),
                 "trace": traceback.format_exc()
             }
         )
+
+
+@app.get("/crm/versao")
+def crm_versao():
+    return jsonify({
+        "ok": True,
+        "versao_crm": "pedidos-lote-v2",
+        "rota": "/crm/cliente-pedidos",
+        "modo": "consulta incremental por offset"
+    })
+
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "10000"))
