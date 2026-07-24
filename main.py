@@ -808,6 +808,174 @@ def estoque_simples():
         return safe_error("Erro ao buscar estoque", extra={"detail": str(e)})
 
 
+
+# =========================================================
+# =========== BUSCA DIRETA DE PRODUTO POR CÓDIGO ==========
+# =========================================================
+def _norm_code(value):
+    return "".join(ch.lower() for ch in str(value or "").strip() if ch.isalnum())
+
+
+def _first_text(obj, keys):
+    if not isinstance(obj, dict):
+        return ""
+    for key in keys:
+        value = obj.get(key)
+        if value is not None and not isinstance(value, (dict, list)):
+            text = str(value).strip()
+            if text:
+                return text
+    return ""
+
+
+def _code_matches(obj, query):
+    if not isinstance(obj, dict):
+        return False
+
+    target = _norm_code(query)
+    if not target:
+        return False
+
+    fields = (
+        "id", "erp_id", "cod_estoque", "codestoque", "codigo_estoque",
+        "codigo", "cod", "codigo_barras", "barcode", "ean", "gtin",
+        "sku", "sku_id", "produto_id", "id_produto"
+    )
+
+    for key in fields:
+        if _norm_code(obj.get(key)) == target:
+            return True
+
+    # Alguns códigos completos também aparecem dentro da tabela de valores.
+    valores = obj.get("valores") or []
+    if isinstance(valores, list):
+        for valor in valores:
+            if isinstance(valor, dict) and _norm_code(valor.get("codigo")) == target:
+                return True
+
+    return False
+
+
+def _normalize_product_from_catalog(parent, stock, code_read):
+    parent = parent if isinstance(parent, dict) else {}
+    stock = stock if isinstance(stock, dict) else {}
+
+    variacao_obj = stock.get("variacao") if isinstance(stock.get("variacao"), dict) else {}
+    cor_obj = stock.get("cor") if isinstance(stock.get("cor"), dict) else {}
+
+    nome = _first_text(parent, ["produto", "nome", "titulo", "descricao", "name"])
+    cor = _first_text(cor_obj, ["nome", "nome_simples", "valor", "cor", "name"])
+    tamanho = _first_text(variacao_obj, ["valor", "nome", "tamanho", "size"])
+
+    erp_id = _first_text(stock, ["erp_id", "cod_estoque", "codigo_estoque", "id"])
+    cod_estoque = _first_text(stock, ["cod_estoque", "erp_id", "codigo_estoque", "id"])
+    codigo_barras = _first_text(stock, ["gtin", "ean", "codigo_barras", "barcode", "cod_estoque", "erp_id"])
+
+    return {
+        "id": _first_text(stock, ["id", "sku_id"]) or _first_text(parent, ["id"]) or code_read,
+        "produto_id": _first_text(parent, ["id"]),
+        "nome": nome or "Produto sem nome",
+        "cor": "" if cor == "." else cor,
+        "tamanho": tamanho,
+        "variacao": tamanho,
+        "erp_id": erp_id or code_read,
+        "cod_estoque": cod_estoque or erp_id or code_read,
+        "codigo_barras": codigo_barras or cod_estoque or erp_id or code_read,
+        "sku": _first_text(stock, ["sku"]),
+        "gtin": _first_text(stock, ["gtin", "ean"]),
+        "estoque": to_int(stock.get("quantidade_em_estoque"), 0),
+        "ativo": str(stock.get("ativo", parent.get("ativo", ""))),
+        "venda": str(parent.get("venda", "")),
+    }
+
+
+@app.get("/wbuy/produto")
+@app.get("/wbuy/produto/buscar")
+def wbuy_produto_buscar():
+    """Localiza uma variação pelo código bipado percorrendo /product/ com paginação.
+
+    O endpoint /product/ retorna produtos-pai e, dentro de cada um, a lista `estoque`
+    com SKU, ERP ID, código externo, cor e tamanho. A busca encerra assim que encontra
+    uma correspondência exata.
+    """
+    try:
+        codigo = (request.args.get("q") or request.args.get("codigo") or "").strip()
+        if not codigo:
+            return safe_error("Informe o código usando ?q=8770774", 400)
+
+        page_size = max(10, min(to_int(request.args.get("page_size", 50), 50), 100))
+        max_pages = max(1, min(to_int(request.args.get("max_pages", 100), 100), 200))
+        cache_key = f"produto_catalogo_v5_{_norm_code(codigo)}"
+        cached = cache_get(cache_key, ttl_sec=900)
+        if cached:
+            return jsonify(cached)
+
+        offset = 0
+        pages = 0
+        total_api = 0
+
+        while True:
+            data = wbuy_get("/product/", params={"limit": f"{offset},{page_size}"})
+            if not total_api:
+                total_api = to_int(data.get("total", 0), 0)
+
+            products = data.get("data") or []
+            if not isinstance(products, list) or not products:
+                break
+
+            for parent in products:
+                if not isinstance(parent, dict):
+                    continue
+
+                # Também aceita o código do produto-pai. Nesse caso, usa a primeira
+                # variação ativa para devolver dados completos.
+                parent_match = _code_matches(parent, codigo)
+                stocks = parent.get("estoque") or []
+                if not isinstance(stocks, list):
+                    stocks = []
+
+                for stock in stocks:
+                    if not isinstance(stock, dict):
+                        continue
+                    if _code_matches(stock, codigo) or parent_match:
+                        produto = _normalize_product_from_catalog(parent, stock, codigo)
+                        payload = {
+                            "ok": True,
+                            "codigo_consultado": codigo,
+                            "origem": "wbuy_product_catalog",
+                            "pagina": pages + 1,
+                            "offset": offset,
+                            "total_api": total_api,
+                            "produto": produto,
+                        }
+                        cache_set(cache_key, payload)
+                        return jsonify(payload)
+
+            pages += 1
+            offset += len(products)
+
+            if total_api and offset >= total_api:
+                break
+            if len(products) < page_size:
+                break
+            if pages >= max_pages:
+                break
+
+        return safe_error(
+            "Produto não encontrado no catálogo da WBuy.",
+            404,
+            {
+                "codigo_consultado": codigo,
+                "paginas_consultadas": pages,
+                "itens_catalogo_consultados": offset,
+                "total_api": total_api,
+            },
+        )
+
+    except Exception as e:
+        return safe_error(str(e), 500, {"trace": traceback.format_exc()})
+
+
 # =========================================================
 # ====================== CRM WHATSAPP ======================
 # =========================================================
