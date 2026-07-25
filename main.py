@@ -243,8 +243,10 @@ def normalize_order_item(item):
     )
 
     status_obj = item.get("status") or {}
+    status_id = ""
 
     if isinstance(status_obj, dict):
+        status_id = str(status_obj.get("id") or "").strip()
         status = (
             status_obj.get("nome")
             or status_obj.get("status_nome")
@@ -350,6 +352,44 @@ def normalize_order_item(item):
         or ""
     )
 
+    cep = (
+        endereco_obj.get("cep")
+        or endereco_obj.get("zipcode")
+        or endereco_obj.get("zip_code")
+        or get_nested(cliente_obj, ["cep"], "")
+        or ""
+    )
+
+    endereco = (
+        endereco_obj.get("endereco")
+        or endereco_obj.get("logradouro")
+        or endereco_obj.get("street")
+        or get_nested(cliente_obj, ["endereco"], "")
+        or ""
+    )
+
+    numero_endereco = (
+        endereco_obj.get("numero")
+        or endereco_obj.get("endnum")
+        or endereco_obj.get("street_number")
+        or get_nested(cliente_obj, ["endnum"], "")
+        or ""
+    )
+
+    bairro = (
+        endereco_obj.get("bairro")
+        or endereco_obj.get("district")
+        or get_nested(cliente_obj, ["bairro"], "")
+        or ""
+    )
+
+    complemento = (
+        endereco_obj.get("complemento")
+        or endereco_obj.get("complement")
+        or get_nested(cliente_obj, ["complemento"], "")
+        or ""
+    )
+
     cidade = (
         endereco_obj.get("cidade")
         or endereco_obj.get("city")
@@ -361,7 +401,14 @@ def normalize_order_item(item):
         endereco_obj.get("estado")
         or endereco_obj.get("uf")
         or endereco_obj.get("state")
+        or get_nested(cliente_obj, ["uf"], "")
         or get_nested(cliente_obj, ["estado"], "")
+        or ""
+    )
+
+    previsao_entrega = (
+        frete_obj.get("estimativa")
+        or item.get("previsao_entrega")
         or ""
     )
 
@@ -369,6 +416,7 @@ def normalize_order_item(item):
         "pedido_id": str(pedido_id),
         "numero": str(numero),
         "cliente": str(cliente_nome),
+        "status_id": str(status_id),
         "status": str(status),
         "data": str(data_pedido),
         "valor_total": valor_total,
@@ -380,8 +428,14 @@ def normalize_order_item(item):
         "cpf_cnpj": str(cpf_cnpj),
         "email": str(email),
         "telefone": str(telefone),
+        "cep": str(cep),
+        "endereco": str(endereco),
+        "numero_endereco": str(numero_endereco),
+        "bairro": str(bairro),
+        "complemento": str(complemento),
         "cidade": str(cidade),
         "uf": str(uf),
+        "previsao_entrega": str(previsao_entrega),
         "cliente_id": str(
             get_nested(item, ["cliente", "id"], "")
             or get_nested(item, ["customer", "id"], "")
@@ -409,12 +463,29 @@ def contains_jt_shipping(item, normalized_row=None):
     return False
 
 
-def row_matches_status(row, status_param):
-    if not status_param:
+def row_matches_wbuy_status(row, status_id="", status_name=""):
+    """Compara o status ATUAL do pedido, nunca apenas o histórico."""
+    row_status_id = str(row.get("status_id") or "").strip()
+    row_status_name = str(row.get("status") or "").strip().lower()
+
+    expected_id = str(status_id or "").strip()
+    expected_name = str(status_name or "").strip().lower()
+
+    if expected_id and row_status_id == expected_id:
         return True
 
-    status_txt = (row.get("status") or "").strip().lower()
-    return status_param in status_txt
+    if expected_name and row_status_name == expected_name:
+        return True
+
+    return False
+
+
+def row_is_in_transport(row):
+    return row_matches_wbuy_status(row, status_id="5", status_name="em transporte")
+
+
+def row_is_completed(row):
+    return row_matches_wbuy_status(row, status_id="7", status_name="pedido concluído")
 
 
 # =========================================================
@@ -594,12 +665,17 @@ def wbuy_pedidos_formas_envio():
 
 @app.get("/wbuy/pedidos/jt")
 def wbuy_pedidos_jt():
+    """Lista pedidos J&T cujo status ATUAL na WBuy é 5 - Em transporte."""
     try:
         page_size = to_int(request.args.get("page_size", 100), 100)
         max_pages = to_int(request.args.get("max_pages", 20), 20)
-        status_param = (request.args.get("status") or "nota fiscal emitida").strip().lower()
 
-        cache_key = f"pedidos_jt_ps{page_size}_mp{max_pages}_st{status_param}"
+        # A WBuy usa o ID 5 para "Em transporte". Mantemos o filtro
+        # local pelo ID e pelo nome para evitar depender somente do texto.
+        status_id = "5"
+        status_name = "em transporte"
+
+        cache_key = f"pedidos_jt_v2_ps{page_size}_mp{max_pages}_sid{status_id}"
         cached = cache_get(cache_key, ttl_sec=180)
         if cached:
             return jsonify(cached)
@@ -607,7 +683,7 @@ def wbuy_pedidos_jt():
         raw_items, total_api = paginate_orders(
             page_size=page_size,
             sleep_ms=0,
-            status_filter=status_param,
+            status_filter=status_id,
             max_pages=max_pages
         )
 
@@ -615,10 +691,13 @@ def wbuy_pedidos_jt():
         for it in raw_items:
             row = normalize_order_item(it)
 
-            if not row_matches_status(row, status_param):
+            if not row_is_in_transport(row):
                 continue
 
             if not contains_jt_shipping(it, row):
+                continue
+
+            if not str(row.get("codigo_rastreio") or "").strip():
                 continue
 
             out.append(row)
@@ -626,8 +705,10 @@ def wbuy_pedidos_jt():
         payload = {
             "ok": True,
             "filtro": {
-                "status": status_param,
-                "transportadora": "J&T"
+                "status_id": status_id,
+                "status": "Em transporte",
+                "transportadora": "J&T",
+                "exige_codigo_rastreio": True
             },
             "total_api": total_api,
             "total": len(out),
@@ -643,21 +724,28 @@ def wbuy_pedidos_jt():
 
 @app.get("/wbuy/pedidos/jt-fast")
 def wbuy_pedidos_jt_fast():
+    """Versão rápida: consulta apenas o primeiro lote de pedidos em transporte."""
     try:
         page_size = to_int(request.args.get("page_size", 100), 100)
-        status_param = (request.args.get("status") or "nota fiscal emitida").strip().lower()
+        status_id = "5"
 
-        data = wbuy_get("/order/", params={"limit": f"0,{page_size}"})
+        data = wbuy_get("/order/", params={
+            "limit": f"0,{page_size}",
+            "status": status_id
+        })
         items = extract_order_list(data)
 
         out = []
         for it in items:
             row = normalize_order_item(it)
 
-            if not row_matches_status(row, status_param):
+            if not row_is_in_transport(row):
                 continue
 
             if not contains_jt_shipping(it, row):
+                continue
+
+            if not str(row.get("codigo_rastreio") or "").strip():
                 continue
 
             out.append(row)
@@ -665,9 +753,58 @@ def wbuy_pedidos_jt_fast():
         return jsonify({
             "ok": True,
             "filtro": {
-                "status": status_param,
-                "transportadora": "J&T"
+                "status_id": status_id,
+                "status": "Em transporte",
+                "transportadora": "J&T",
+                "exige_codigo_rastreio": True
             },
+            "total": len(out),
+            "data": out
+        })
+
+    except Exception as e:
+        return safe_error(str(e), 500, {"trace": traceback.format_exc()})
+
+
+@app.get("/wbuy/pedidos/jt-entregues")
+def wbuy_pedidos_jt_entregues():
+    """Lista pedidos J&T cujo status ATUAL é 7 - Pedido concluído."""
+    try:
+        page_size = to_int(request.args.get("page_size", 100), 100)
+        max_pages = to_int(request.args.get("max_pages", 10), 10)
+        status_id = "7"
+
+        raw_items, total_api = paginate_orders(
+            page_size=page_size,
+            sleep_ms=0,
+            status_filter=status_id,
+            max_pages=max_pages
+        )
+
+        out = []
+        for it in raw_items:
+            row = normalize_order_item(it)
+
+            if not row_is_completed(row):
+                continue
+
+            if not contains_jt_shipping(it, row):
+                continue
+
+            if not str(row.get("codigo_rastreio") or "").strip():
+                continue
+
+            out.append(row)
+
+        return jsonify({
+            "ok": True,
+            "filtro": {
+                "status_id": status_id,
+                "status": "Pedido concluído",
+                "transportadora": "J&T",
+                "exige_codigo_rastreio": True
+            },
+            "total_api": total_api,
             "total": len(out),
             "data": out
         })
