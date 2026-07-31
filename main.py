@@ -1,4 +1,5 @@
 import os
+import re
 import time
 import traceback
 import requests
@@ -463,6 +464,57 @@ def contains_jt_shipping(item, normalized_row=None):
     return False
 
 
+
+def is_correios_tracking_code(value):
+    """Reconhece o padrão oficial de objetos dos Correios: AA123456789BR."""
+    tracking = str(value or "").strip().upper()
+    return re.fullmatch(r"[A-Z]{2}\d{9}BR", tracking) is not None
+
+
+def contains_correios_shipping(item, normalized_row=None):
+    """Identifica Correios pelo serviço, transportadora ou padrão do rastreio."""
+    frete = item.get("frete") or {}
+    row = normalized_row or normalize_order_item(item)
+
+    nome = str(frete.get("nome") or row.get("forma_envio") or "").strip().lower()
+    tipo = str(
+        frete.get("tipo_envio_nome")
+        or row.get("transportadora")
+        or ""
+    ).strip().lower()
+    rastreio = str(
+        frete.get("rastreio")
+        or row.get("codigo_rastreio")
+        or ""
+    ).strip().upper()
+
+    if "correios" in nome or "correios" in tipo:
+        return True
+
+    if any(servico in nome for servico in ("sedex", "pac", "mini envios")):
+        return True
+
+    return is_correios_tracking_code(rastreio)
+
+
+def detect_shipping_carrier(item, normalized_row=None):
+    """Retorna correios, jt ou outro sem impedir a importação do pedido."""
+    row = normalized_row or normalize_order_item(item)
+
+    if contains_correios_shipping(item, row):
+        return "correios"
+
+    if contains_jt_shipping(item, row):
+        return "jt"
+
+    tracking = str(row.get("codigo_rastreio") or "").strip()
+
+    if tracking.isdigit():
+        return "jt"
+
+    return "outro"
+
+
 def row_matches_wbuy_status(row, status_id="", status_name=""):
     """Compara o status ATUAL do pedido, nunca apenas o histórico."""
     row_status_id = str(row.get("status_id") or "").strip()
@@ -661,6 +713,172 @@ def wbuy_pedidos_formas_envio():
 
     except Exception as e:
         return safe_error(str(e), 500, {"trace": traceback.format_exc()})
+
+
+
+@app.get("/wbuy/pedidos/transporte")
+def wbuy_pedidos_transporte():
+    """
+    Lista todos os pedidos cujo status ATUAL na WBuy é 5 - Em transporte
+    e que possuem código de rastreio, sem limitar a uma transportadora.
+    """
+    try:
+        page_size = max(
+            1,
+            min(to_int(request.args.get("page_size", 100), 100), 200)
+        )
+        max_pages = max(
+            1,
+            min(to_int(request.args.get("max_pages", 20), 20), 200)
+        )
+
+        status_id = "5"
+        status_name = "em transporte"
+
+        cache_key = (
+            f"pedidos_transporte_v2_ps{page_size}_"
+            f"mp{max_pages}_sid{status_id}"
+        )
+        cached = cache_get(cache_key, ttl_sec=180)
+
+        if cached:
+            return jsonify(cached)
+
+        raw_items, total_api = paginate_orders(
+            page_size=page_size,
+            sleep_ms=0,
+            status_filter=status_id,
+            max_pages=max_pages
+        )
+
+        out = []
+        totals_by_carrier = {
+            "jt": 0,
+            "correios": 0,
+            "outro": 0,
+        }
+
+        for item in raw_items:
+            row = normalize_order_item(item)
+
+            if not row_is_in_transport(row):
+                continue
+
+            tracking = str(row.get("codigo_rastreio") or "").strip().upper()
+
+            if not tracking:
+                continue
+
+            carrier = detect_shipping_carrier(item, row)
+            row["codigo_rastreio"] = tracking
+            row["transportadora_detectada"] = carrier
+            row["carrier"] = carrier
+
+            totals_by_carrier[carrier] = totals_by_carrier.get(carrier, 0) + 1
+            out.append(row)
+
+        payload = {
+            "ok": True,
+            "filtro": {
+                "status_id": status_id,
+                "status": "Em transporte",
+                "transportadora": "Todas",
+                "exige_codigo_rastreio": True,
+            },
+            "total_api": total_api,
+            "total": len(out),
+            "totais_transportadora": totals_by_carrier,
+            "data": out,
+        }
+
+        cache_set(cache_key, payload)
+        return jsonify(payload)
+
+    except Exception as e:
+        return safe_error(
+            str(e),
+            500,
+            {"trace": traceback.format_exc()}
+        )
+
+
+@app.get("/wbuy/pedidos/correios")
+def wbuy_pedidos_correios():
+    """
+    Lista pedidos dos Correios cujo status ATUAL na WBuy é
+    5 - Em transporte e que possuem código de rastreio.
+    """
+    try:
+        page_size = max(
+            1,
+            min(to_int(request.args.get("page_size", 100), 100), 200)
+        )
+        max_pages = max(
+            1,
+            min(to_int(request.args.get("max_pages", 20), 20), 200)
+        )
+
+        status_id = "5"
+
+        cache_key = (
+            f"pedidos_correios_v2_ps{page_size}_"
+            f"mp{max_pages}_sid{status_id}"
+        )
+        cached = cache_get(cache_key, ttl_sec=180)
+
+        if cached:
+            return jsonify(cached)
+
+        raw_items, total_api = paginate_orders(
+            page_size=page_size,
+            sleep_ms=0,
+            status_filter=status_id,
+            max_pages=max_pages
+        )
+
+        out = []
+
+        for item in raw_items:
+            row = normalize_order_item(item)
+
+            if not row_is_in_transport(row):
+                continue
+
+            if not contains_correios_shipping(item, row):
+                continue
+
+            tracking = str(row.get("codigo_rastreio") or "").strip().upper()
+
+            if not tracking:
+                continue
+
+            row["codigo_rastreio"] = tracking
+            row["transportadora_detectada"] = "correios"
+            row["carrier"] = "correios"
+            out.append(row)
+
+        payload = {
+            "ok": True,
+            "filtro": {
+                "status_id": status_id,
+                "status": "Em transporte",
+                "transportadora": "Correios",
+                "exige_codigo_rastreio": True,
+            },
+            "total_api": total_api,
+            "total": len(out),
+            "data": out,
+        }
+
+        cache_set(cache_key, payload)
+        return jsonify(payload)
+
+    except Exception as e:
+        return safe_error(
+            str(e),
+            500,
+            {"trace": traceback.format_exc()}
+        )
 
 
 @app.get("/wbuy/pedidos/jt")
