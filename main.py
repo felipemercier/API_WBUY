@@ -540,6 +540,115 @@ def row_is_completed(row):
     return row_matches_wbuy_status(row, status_id="7", status_name="pedido concluído")
 
 
+
+def extract_single_order(data):
+    """
+    Extrai um único pedido das variações de resposta da WBuy.
+    """
+    if not isinstance(data, dict):
+        return None
+
+    payload = data.get("data")
+
+    if isinstance(payload, dict):
+        # algumas respostas podem embrulhar o pedido
+        for key in ("pedido", "order", "data"):
+            candidate = payload.get(key)
+            if isinstance(candidate, dict):
+                return candidate
+        return payload
+
+    if isinstance(payload, list) and payload:
+        return payload[0] if isinstance(payload[0], dict) else None
+
+    for key in ("pedido", "order"):
+        candidate = data.get(key)
+        if isinstance(candidate, dict):
+            return candidate
+
+    return None
+
+
+def fetch_order_by_id(order_id):
+    """
+    Busca o estado ATUAL de um pedido diretamente na WBuy.
+
+    A primeira tentativa usa /order/{id}. Caso a instalação da WBuy
+    não aceite essa forma, fazemos fallback pela listagem /order/
+    procurando o ID exato. O fallback é mais caro, mas evita perder
+    a reconciliação.
+    """
+    order_id = str(order_id or "").strip()
+    if not order_id:
+        raise ValueError("pedido_id vazio")
+
+    # Tentativa direta.
+    direct_errors = []
+
+    for path in (
+        f"/order/{order_id}",
+        f"/order/{order_id}/",
+    ):
+        try:
+            data = wbuy_get(path)
+            item = extract_single_order(data)
+            if isinstance(item, dict):
+                row = normalize_order_item(item)
+                if str(row.get("pedido_id") or "").strip() == order_id:
+                    return row
+                # Algumas respostas não repetem o ID no payload.
+                if not str(row.get("pedido_id") or "").strip():
+                    row["pedido_id"] = order_id
+                    if not str(row.get("numero") or "").strip():
+                        row["numero"] = order_id
+                    return row
+        except Exception as e:
+            direct_errors.append(str(e))
+
+    # Fallback: percorre os pedidos até localizar o ID.
+    raw_items, _ = paginate_orders(
+        page_size=200,
+        sleep_ms=0,
+        status_filter=None,
+        max_pages=200
+    )
+
+    for item in raw_items:
+        row = normalize_order_item(item)
+        if str(row.get("pedido_id") or "").strip() == order_id:
+            return row
+
+    raise LookupError(
+        f"Pedido {order_id} não encontrado na WBuy."
+        + (
+            " Tentativas diretas: " + " | ".join(direct_errors[:2])
+            if direct_errors
+            else ""
+        )
+    )
+
+
+def normalize_reconciled_order(row):
+    """
+    Padroniza transportadora/rastreio sem filtrar pelo status.
+    """
+    row = dict(row or {})
+    raw = row.get("raw") if isinstance(row.get("raw"), dict) else {}
+    tracking = str(row.get("codigo_rastreio") or "").strip().upper()
+
+    row["codigo_rastreio"] = tracking
+
+    if tracking:
+        carrier = detect_shipping_carrier(raw, row)
+    else:
+        carrier = "outro"
+
+    row["transportadora_detectada"] = carrier
+    row["carrier"] = carrier
+
+    return row
+
+
 # =========================================================
 # ========================= ROTAS =========================
 # =========================================================
@@ -1029,6 +1138,81 @@ def wbuy_pedidos_jt_entregues():
 
     except Exception as e:
         return safe_error(str(e), 500, {"trace": traceback.format_exc()})
+
+
+
+@app.post("/wbuy/pedidos/reconciliar")
+def wbuy_pedidos_reconciliar():
+    """
+    Revalida pedidos conhecidos pelo ID, independentemente do status atual.
+
+    Body:
+      {"ids": ["13288816", "13299999"]}
+
+    Uso:
+      o Logistics Center envia somente os pedidos que ainda considera
+      ativos mas que desapareceram da listagem status 5.
+    """
+    try:
+        body = request.get_json(silent=True) or {}
+        ids = body.get("ids") or body.get("pedido_ids") or []
+
+        if isinstance(ids, str):
+            ids = [x.strip() for x in ids.split(",") if x.strip()]
+
+        if not isinstance(ids, list):
+            return safe_error("Campo ids deve ser uma lista.", 400)
+
+        # Limite de segurança por execução.
+        clean_ids = []
+        seen = set()
+
+        for value in ids:
+            order_id = str(value or "").strip()
+            if not order_id or order_id in seen:
+                continue
+            seen.add(order_id)
+            clean_ids.append(order_id)
+
+        if len(clean_ids) > 100:
+            return safe_error(
+                "Máximo de 100 pedidos por reconciliação.",
+                400
+            )
+
+        data = []
+        errors = []
+
+        for index, order_id in enumerate(clean_ids, start=1):
+            try:
+                row = fetch_order_by_id(order_id)
+                row = normalize_reconciled_order(row)
+                data.append(row)
+            except Exception as e:
+                errors.append({
+                    "pedido_id": order_id,
+                    "error": str(e),
+                })
+
+            # pequena folga para não pressionar a WBuy em lotes grandes
+            if index % 20 == 0:
+                time.sleep(0.08)
+
+        return jsonify({
+            "ok": True,
+            "requested": len(clean_ids),
+            "found": len(data),
+            "failed": len(errors),
+            "data": data,
+            "errors": errors,
+        })
+
+    except Exception as e:
+        return safe_error(
+            str(e),
+            500,
+            {"trace": traceback.format_exc()}
+        )
 
 
 @app.get("/wbuy/produtos")
