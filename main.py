@@ -244,14 +244,32 @@ def normalize_order_item(item):
     )
 
     status_obj = item.get("status") or {}
-    status_id = ""
+
+    # A WBuy pode devolver o status em formatos diferentes dependendo da rota:
+    # - status como objeto: {"id": 7, "nome": "Pedido concluído"}
+    # - status como texto + status_id no nível principal.
+    # Sempre priorizamos o ID explícito do payload atual.
+    status_id = str(
+        item.get("status_id")
+        or item.get("id_status")
+        or item.get("situacao_id")
+        or ""
+    ).strip()
 
     if isinstance(status_obj, dict):
-        status_id = str(status_obj.get("id") or "").strip()
+        status_id = str(
+            status_obj.get("id")
+            or status_obj.get("status_id")
+            or status_id
+            or ""
+        ).strip()
         status = (
             status_obj.get("nome")
             or status_obj.get("status_nome")
             or status_obj.get("descricao")
+            or item.get("status_descricao")
+            or item.get("situacao")
+            or item.get("order_status")
             or ""
         )
     else:
@@ -626,6 +644,64 @@ def fetch_order_by_id(order_id):
             else ""
         )
     )
+
+
+def fetch_orders_snapshot_by_ids(order_ids, page_size=200, max_pages=200):
+    """
+    Busca os pedidos solicitados em um snapshot SEM filtro de status.
+
+    Esta é a fonte autoritativa da reconciliação: evita confiar em /order/{id},
+    que pode responder em formato diferente ou com informação inconsistente em
+    algumas instalações. A listagem /order/ é a mesma base usada pela WBuy para
+    montar a listagem administrativa de pedidos.
+
+    Retorna: (mapa_por_id, ids_nao_encontrados, total_api)
+    """
+    wanted = {str(v or "").strip() for v in (order_ids or []) if str(v or "").strip()}
+    if not wanted:
+        return {}, [], 0
+
+    found = {}
+    pending = set(wanted)
+    offset = 0
+    pages = 0
+    total_api = 0
+
+    while pending:
+        data = wbuy_get(
+            "/order/",
+            params={"limit": f"{offset},{page_size}"}
+        )
+
+        if not total_api:
+            total_api = to_int(data.get("total", 0), 0)
+
+        items = extract_order_list(data)
+        if not items:
+            break
+
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            row = normalize_order_item(item)
+            oid = str(row.get("pedido_id") or "").strip()
+            if oid in pending:
+                found[oid] = row
+                pending.remove(oid)
+
+        offset += len(items)
+        pages += 1
+
+        if not pending:
+            break
+        if total_api and offset >= total_api:
+            break
+        if len(items) < page_size:
+            break
+        if max_pages and pages >= max_pages:
+            break
+
+    return found, sorted(pending), total_api
 
 
 def normalize_reconciled_order(row):
@@ -1183,26 +1259,32 @@ def wbuy_pedidos_reconciliar():
         data = []
         errors = []
 
-        for index, order_id in enumerate(clean_ids, start=1):
-            try:
-                row = fetch_order_by_id(order_id)
-                row = normalize_reconciled_order(row)
-                data.append(row)
-            except Exception as e:
+        # IMPORTANTE: os IDs recebidos aqui são justamente os pedidos que o
+        # Logistics Center ainda tinha como ativos, mas que NÃO apareceram na
+        # listagem atual de status 5. Para não ressuscitar status antigos,
+        # fazemos uma única leitura autoritativa da listagem geral /order/.
+        snapshot, missing_ids, total_api = fetch_orders_snapshot_by_ids(clean_ids)
+
+        for order_id in clean_ids:
+            row = snapshot.get(order_id)
+            if row is None:
                 errors.append({
                     "pedido_id": order_id,
-                    "error": str(e),
+                    "error": "Pedido não encontrado no snapshot atual da WBuy.",
                 })
+                continue
 
-            # pequena folga para não pressionar a WBuy em lotes grandes
-            if index % 20 == 0:
-                time.sleep(0.08)
+            row = normalize_reconciled_order(row)
+            data.append(row)
 
         return jsonify({
             "ok": True,
             "requested": len(clean_ids),
             "found": len(data),
             "failed": len(errors),
+            "total_api": total_api,
+            "missing_ids": missing_ids,
+            "source": "wbuy_order_snapshot_unfiltered",
             "data": data,
             "errors": errors,
         })
