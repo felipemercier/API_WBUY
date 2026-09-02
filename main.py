@@ -1810,6 +1810,237 @@ def crm_versao():
     })
 
 
+
+# =========================================================
+# ================ COLLAB WBUY (ISOLADO) ==================
+# =========================================================
+# Rotas exclusivas do Martier Collab.
+# IMPORTANTE: este bloco foi adicionado sem alterar as rotas existentes.
+
+def collab_float(value):
+    if value is None:
+        return 0.0
+    if isinstance(value, (int, float)):
+        return float(value)
+    s = str(value).strip().replace("R$", "").replace(" ", "")
+    if not s:
+        return 0.0
+    if "," in s and "." in s:
+        s = s.replace(".", "").replace(",", ".")
+    elif "," in s:
+        s = s.replace(",", ".")
+    try:
+        return float(s)
+    except Exception:
+        return 0.0
+
+
+def collab_text(obj, *keys):
+    if not isinstance(obj, dict):
+        return ""
+    for key in keys:
+        value = obj.get(key)
+        if value is not None and not isinstance(value, (dict, list)):
+            value = str(value).strip()
+            if value:
+                return value
+    return ""
+
+
+def normalize_collab_product(produto):
+    produto = produto if isinstance(produto, dict) else {}
+    codigo = collab_text(
+        produto, "cod_estoque", "erp_id", "codigo_externo",
+        "codigo_variacao", "codigo_barras"
+    )
+    return {
+        "produto": collab_text(produto, "produto", "nome"),
+        "produto_id": collab_text(produto, "produto_id", "id_produto"),
+        "sku_id": collab_text(produto, "sku_id", "id"),
+        "sku": collab_text(produto, "sku"),
+        "codigo_externo": codigo,
+        "erp_id": collab_text(produto, "erp_id"),
+        "cod_estoque": collab_text(produto, "cod_estoque"),
+        "cor": "" if collab_text(produto, "cor") == "." else collab_text(produto, "cor"),
+        "tamanho": collab_text(produto, "variacaoValor", "tamanho", "variacao"),
+        "quantidade": to_int(produto.get("qtd", produto.get("quantidade", 1)), 1),
+        "valor_unitario": round(collab_float(produto.get("valor")), 2),
+        "valor_de": round(collab_float(produto.get("valor_de")), 2),
+    }
+
+
+def normalize_collab_order(item):
+    item = item if isinstance(item, dict) else {}
+    valor_total = item.get("valor_total") if isinstance(item.get("valor_total"), dict) else {}
+    frete = item.get("frete") if isinstance(item.get("frete"), dict) else {}
+    cupom = item.get("cupom") if isinstance(item.get("cupom"), dict) else {}
+    vendedor = item.get("vendedor") if isinstance(item.get("vendedor"), dict) else {}
+    pagamento = item.get("pagamento") if isinstance(item.get("pagamento"), dict) else {}
+    status = item.get("status") if isinstance(item.get("status"), dict) else {}
+
+    desconto_cupom = 0.0
+    desconto_pagamento = 0.0
+    outros_descontos = 0.0
+    historico = []
+
+    for desconto in item.get("historico_desconto") or []:
+        if not isinstance(desconto, dict):
+            continue
+        tipo = str(desconto.get("tipo") or "").strip()
+        valor = collab_float(desconto.get("valor"))
+        tipo_lower = tipo.lower()
+
+        historico.append({
+            "tipo": tipo,
+            "valor": round(valor, 2),
+            "valor_calculavel": round(collab_float(desconto.get("valor_calculavel")), 2),
+        })
+
+        if "cupom" in tipo_lower:
+            desconto_cupom += valor
+        elif "meio de pagamento" in tipo_lower or "forma de pagamento" in tipo_lower:
+            desconto_pagamento += valor
+        else:
+            outros_descontos += valor
+
+    desconto_total = collab_float(valor_total.get("desconto"))
+    soma_historico = desconto_cupom + desconto_pagamento + outros_descontos
+    if desconto_total > soma_historico:
+        outros_descontos += (desconto_total - soma_historico)
+
+    produtos = [
+        normalize_collab_product(p)
+        for p in (item.get("produtos") or [])
+        if isinstance(p, dict)
+    ]
+
+    return {
+        "pedido_id": collab_text(item, "id", "pedido_id", "order_id"),
+        "data": collab_text(item, "data", "data_pedido", "created_at"),
+        "status_id": collab_text(status, "id", "status_id") or collab_text(item, "status_id"),
+        "status": collab_text(status, "nome", "status_nome") or collab_text(item, "status"),
+        "isPay": str(item.get("isPay", "")),
+        "faturado": str(item.get("faturado", "")),
+        "cupom": collab_text(cupom, "cupom", "codigo", "code"),
+        "cupom_id": collab_text(cupom, "id"),
+        "cupom_tipo": collab_text(cupom, "tipo"),
+        "cupom_valor": round(collab_float(cupom.get("valor")), 2),
+        "vendedor": {
+            "id": collab_text(vendedor, "id"),
+            "codigo": collab_text(vendedor, "codigo"),
+            "nome": collab_text(vendedor, "nome"),
+            "comissao": round(collab_float(vendedor.get("comissao")), 2),
+        },
+        "pagamento": {
+            "id": collab_text(pagamento, "id"),
+            "servico": collab_text(pagamento, "servico"),
+            "tipo": collab_text(pagamento, "tipo"),
+            "tipo_interno": collab_text(pagamento, "tipo_interno"),
+            "parcelas": collab_text(pagamento, "parcelas"),
+        },
+        "subtotal": round(collab_float(valor_total.get("subtotal")), 2),
+        "desconto_cupom": round(desconto_cupom, 2),
+        "desconto_pagamento": round(desconto_pagamento, 2),
+        "outros_descontos": round(outros_descontos, 2),
+        "desconto_total": round(desconto_total, 2),
+        "acrescimo": round(collab_float(valor_total.get("acrescimo")), 2),
+        "frete": round(collab_float(valor_total.get("frete", frete.get("valor"))), 2),
+        "total": round(collab_float(valor_total.get("total")), 2),
+        "total_sem_desconto": round(collab_float(valor_total.get("total_sem_desconto")), 2),
+        "historico_desconto": historico,
+        "produtos": produtos,
+    }
+
+
+@app.get("/wbuy/collab/pedidos")
+def wbuy_collab_pedidos():
+    """
+    Endpoint isolado para o Martier Collab.
+    Lê /order/ sem modificar nenhuma rota existente e expõe cupom,
+    descontos, frete, pagamento e itens em formato estável.
+    Filtros opcionais:
+      ?cupom=TROVATTO
+      ?data_inicio=2026-07-01
+      ?data_fim=2026-09-02
+      ?offset=0&limit=100
+    """
+    try:
+        cupom_filtro = (request.args.get("cupom") or "").strip().upper()
+        data_inicio = (request.args.get("data_inicio") or "").strip()
+        data_fim = (request.args.get("data_fim") or "").strip()
+        offset = max(0, to_int(request.args.get("offset", 0), 0))
+        limit = max(1, min(to_int(request.args.get("limit", 100), 100), 200))
+
+        raw = wbuy_get("/order/", params={"limit": f"{offset},{limit}"})
+        items = extract_order_list(raw)
+        total_api = to_int(raw.get("total", 0), 0) if isinstance(raw, dict) else 0
+
+        out = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+
+            row = normalize_collab_order(item)
+            data_pedido = row.get("data", "")
+            cupom_pedido = str(row.get("cupom") or "").strip().upper()
+
+            if cupom_filtro and cupom_pedido != cupom_filtro:
+                continue
+            if data_inicio and data_pedido and data_pedido[:10] < data_inicio:
+                continue
+            if data_fim and data_pedido and data_pedido[:10] > data_fim:
+                continue
+
+            out.append(row)
+
+        proximo_offset = offset + len(items)
+        terminou = (
+            len(items) == 0
+            or (total_api > 0 and proximo_offset >= total_api)
+            or len(items) < limit
+        )
+
+        return jsonify({
+            "ok": True,
+            "origem": "wbuy_order_collab",
+            "offset": offset,
+            "limit": limit,
+            "recebidos_api": len(items),
+            "total_api": total_api,
+            "proximo_offset": proximo_offset,
+            "terminou": terminou,
+            "filtros": {
+                "cupom": cupom_filtro,
+                "data_inicio": data_inicio,
+                "data_fim": data_fim,
+            },
+            "total_filtrado_no_lote": len(out),
+            "data": out,
+        })
+
+    except Exception as e:
+        return safe_error(str(e), 500, {"trace": traceback.format_exc()})
+
+
+@app.get("/wbuy/collab/pedido/<pedido_id>")
+def wbuy_collab_pedido(pedido_id):
+    """Diagnóstico de um pedido específico para o Collab."""
+    try:
+        row = fetch_order_by_id(pedido_id)
+        raw = row.get("raw") if isinstance(row, dict) else None
+        if not isinstance(raw, dict):
+            return safe_error("Pedido encontrado sem payload bruto.", 502)
+        return jsonify({
+            "ok": True,
+            "origem": "wbuy_order_collab",
+            "data": normalize_collab_order(raw),
+        })
+    except LookupError as e:
+        return safe_error(str(e), 404)
+    except Exception as e:
+        return safe_error(str(e), 500, {"trace": traceback.format_exc()})
+
+
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "10000"))
     app.run(host="0.0.0.0", port=port, debug=False)
