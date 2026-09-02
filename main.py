@@ -1866,6 +1866,9 @@ def normalize_collab_product(produto):
         "quantidade": to_int(produto.get("qtd", produto.get("quantidade", 1)), 1),
         "valor_unitario": round(collab_float(produto.get("valor")), 2),
         "valor_de": round(collab_float(produto.get("valor_de")), 2),
+        "is_atacado": str(produto.get("is_atacado", "")),
+        "tabela": str(produto.get("tabela", "")),
+        "brinde": str(produto.get("brinde", "")),
     }
 
 
@@ -1914,6 +1917,14 @@ def normalize_collab_order(item):
         if isinstance(p, dict)
     ]
 
+    # Atacado: considera os itens comerciais (ignora brindes).
+    # A WBuy marca atacado com is_atacado=1 e/ou tabela=2.
+    itens_comerciais = [p for p in produtos if str(p.get("brinde", "")) != "1"]
+    atacado = any(
+        str(p.get("is_atacado", "")) == "1" or str(p.get("tabela", "")) == "2"
+        for p in itens_comerciais
+    )
+
     return {
         "pedido_id": collab_text(item, "id", "pedido_id", "order_id"),
         "data": collab_text(item, "data", "data_pedido", "created_at"),
@@ -1921,6 +1932,8 @@ def normalize_collab_order(item):
         "status": collab_text(status, "nome", "status_nome") or collab_text(item, "status"),
         "isPay": str(item.get("isPay", "")),
         "faturado": str(item.get("faturado", "")),
+        "atacado": atacado,
+        "tipo_venda": "atacado" if atacado else "varejo",
         "cupom": collab_text(cupom, "cupom", "codigo", "code"),
         "cupom_id": collab_text(cupom, "id"),
         "cupom_tipo": collab_text(cupom, "tipo"),
