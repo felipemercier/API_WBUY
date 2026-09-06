@@ -2054,6 +2054,91 @@ def wbuy_collab_pedido(pedido_id):
         return safe_error(str(e), 500, {"trace": traceback.format_exc()})
 
 
+# =========================================================
+# ===== CARGA INICIAL PARA PRECIFICACAO (BANCO LOCAL) =====
+# =========================================================
+@app.get("/wbuy/pedidos/precificacao")
+def wbuy_pedidos_precificacao():
+    """Retorna um snapshot enxuto de pedidos para a carga inicial da Precificacao.
+
+    Query: start=YYYY-MM-DD&end=YYYY-MM-DD&page_size=200&max_pages=200
+    A rota percorre a paginacao da WBuy no servidor e devolve somente dados
+    necessarios para indicadores/margem, sem dados pessoais do cliente.
+    """
+    try:
+        from datetime import datetime, date
+
+        start_s = (request.args.get("start") or "").strip()
+        end_s = (request.args.get("end") or "").strip()
+        if not start_s or not end_s:
+            return safe_error("Informe start e end no formato YYYY-MM-DD.", 400)
+
+        try:
+            start_d = datetime.strptime(start_s, "%Y-%m-%d").date()
+            end_d = datetime.strptime(end_s, "%Y-%m-%d").date()
+        except ValueError:
+            return safe_error("Datas invalidas. Use YYYY-MM-DD.", 400)
+        if end_d < start_d:
+            return safe_error("Data final anterior a data inicial.", 400)
+
+        page_size = max(1, min(to_int(request.args.get("page_size", 200), 200), 200))
+        max_pages = max(1, min(to_int(request.args.get("max_pages", 200), 200), 500))
+        raw_items, total_api = paginate_orders(page_size=page_size, sleep_ms=0, status_filter=None, max_pages=max_pages)
+
+        out = []
+        for item in raw_items:
+            if not isinstance(item, dict):
+                continue
+            row = normalize_order_item(item)
+            raw_date = str(row.get("data") or "").strip()
+            if not raw_date:
+                continue
+            parsed = None
+            for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d", "%d/%m/%Y %H:%M:%S", "%d/%m/%Y"):
+                try:
+                    parsed = datetime.strptime(raw_date[:19] if fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S") else raw_date[:10], fmt)
+                    break
+                except ValueError:
+                    pass
+            if parsed is None:
+                try:
+                    parsed = datetime.fromisoformat(raw_date.replace("Z", "+00:00"))
+                except Exception:
+                    continue
+            if not (start_d <= parsed.date() <= end_d):
+                continue
+
+            qty = 0
+            produtos = row.get("produtos") or []
+            if isinstance(produtos, list):
+                for prod in produtos:
+                    if isinstance(prod, dict):
+                        qty += max(1, to_int(prod.get("qtd", prod.get("quantidade", prod.get("qty", 1))), 1))
+
+            out.append({
+                "id": row.get("pedido_id") or row.get("numero"),
+                "pedido_id": row.get("pedido_id") or row.get("numero"),
+                "numero": row.get("numero"),
+                "data": raw_date,
+                "status_id": row.get("status_id", ""),
+                "status_nome": row.get("status", ""),
+                "valor_total": row.get("valor_total", 0),
+                "quantidade_itens": qty,
+            })
+
+        return jsonify({
+            "ok": True,
+            "source": "wbuy_snapshot_precificacao",
+            "periodo": {"start": start_s, "end": end_s},
+            "total_api": total_api,
+            "pedidos_lidos": len(raw_items),
+            "total_periodo": len(out),
+            "data": out,
+        })
+    except Exception as e:
+        return safe_error(str(e), 500, {"trace": traceback.format_exc()})
+
+
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "10000"))
     app.run(host="0.0.0.0", port=port, debug=False)
