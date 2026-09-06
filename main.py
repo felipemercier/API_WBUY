@@ -2059,14 +2059,16 @@ def wbuy_collab_pedido(pedido_id):
 # =========================================================
 @app.get("/wbuy/pedidos/precificacao")
 def wbuy_pedidos_precificacao():
-    """Retorna um snapshot enxuto de pedidos para a carga inicial da Precificacao.
+    """Retorna UM lote da WBuy por chamada para evitar timeout do Gunicorn.
 
-    Query: start=YYYY-MM-DD&end=YYYY-MM-DD&page_size=200&max_pages=200
-    A rota percorre a paginacao da WBuy no servidor e devolve somente dados
-    necessarios para indicadores/margem, sem dados pessoais do cliente.
+    Query:
+      start=YYYY-MM-DD&end=YYYY-MM-DD&offset=0&limit=100
+
+    A Precificacao chama esta rota repetidamente usando proximo_offset ate
+    terminou=true. O filtro de datas e aplicado localmente em cada lote.
     """
     try:
-        from datetime import datetime, date
+        from datetime import datetime
 
         start_s = (request.args.get("start") or "").strip()
         end_s = (request.args.get("end") or "").strip()
@@ -2081,31 +2083,53 @@ def wbuy_pedidos_precificacao():
         if end_d < start_d:
             return safe_error("Data final anterior a data inicial.", 400)
 
-        page_size = max(1, min(to_int(request.args.get("page_size", 200), 200), 200))
-        max_pages = max(1, min(to_int(request.args.get("max_pages", 200), 200), 500))
-        raw_items, total_api = paginate_orders(page_size=page_size, sleep_ms=0, status_filter=None, max_pages=max_pages)
+        offset = max(0, to_int(request.args.get("offset", 0), 0))
+        limit = max(1, min(to_int(request.args.get("limit", 100), 100), 100))
+
+        # IMPORTANTE: somente UMA requisicao WBuy por chamada HTTP.
+        raw = wbuy_get("/order/", params={"limit": f"{offset},{limit}"})
+        items = extract_order_list(raw)
+        total_api = to_int(raw.get("total", 0), 0) if isinstance(raw, dict) else 0
 
         out = []
-        for item in raw_items:
+        datas_validas = []
+
+        for item in items:
             if not isinstance(item, dict):
                 continue
+
             row = normalize_order_item(item)
             raw_date = str(row.get("data") or "").strip()
             if not raw_date:
                 continue
+
             parsed = None
-            for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d", "%d/%m/%Y %H:%M:%S", "%d/%m/%Y"):
+            for fmt in (
+                "%Y-%m-%d %H:%M:%S",
+                "%Y-%m-%dT%H:%M:%S",
+                "%Y-%m-%d",
+                "%d/%m/%Y %H:%M:%S",
+                "%d/%m/%Y",
+            ):
                 try:
-                    parsed = datetime.strptime(raw_date[:19] if fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S") else raw_date[:10], fmt)
+                    value = raw_date[:19] if fmt in (
+                        "%Y-%m-%d %H:%M:%S",
+                        "%Y-%m-%dT%H:%M:%S",
+                    ) else raw_date[:10]
+                    parsed = datetime.strptime(value, fmt)
                     break
                 except ValueError:
                     pass
+
             if parsed is None:
                 try:
                     parsed = datetime.fromisoformat(raw_date.replace("Z", "+00:00"))
                 except Exception:
                     continue
-            if not (start_d <= parsed.date() <= end_d):
+
+            pedido_date = parsed.date()
+            datas_validas.append(pedido_date)
+            if not (start_d <= pedido_date <= end_d):
                 continue
 
             qty = 0
@@ -2113,7 +2137,13 @@ def wbuy_pedidos_precificacao():
             if isinstance(produtos, list):
                 for prod in produtos:
                     if isinstance(prod, dict):
-                        qty += max(1, to_int(prod.get("qtd", prod.get("quantidade", prod.get("qty", 1))), 1))
+                        qty += max(
+                            1,
+                            to_int(
+                                prod.get("qtd", prod.get("quantidade", prod.get("qty", 1))),
+                                1,
+                            ),
+                        )
 
             out.append({
                 "id": row.get("pedido_id") or row.get("numero"),
@@ -2126,15 +2156,34 @@ def wbuy_pedidos_precificacao():
                 "quantidade_itens": qty,
             })
 
+        proximo_offset = offset + len(items)
+        terminou_api = (
+            len(items) == 0
+            or (total_api > 0 and proximo_offset >= total_api)
+            or len(items) < limit
+        )
+
+        # Se a API estiver ordenada do mais novo para o mais antigo e todo o
+        # lote ja ficou antes do inicio solicitado, nao precisamos continuar.
+        terminou_periodo = bool(datas_validas) and max(datas_validas) < start_d
+        terminou = terminou_api or terminou_periodo
+
         return jsonify({
             "ok": True,
-            "source": "wbuy_snapshot_precificacao",
+            "source": "wbuy_precificacao_paginada",
             "periodo": {"start": start_s, "end": end_s},
+            "offset": offset,
+            "limit": limit,
+            "recebidos_api": len(items),
             "total_api": total_api,
-            "pedidos_lidos": len(raw_items),
-            "total_periodo": len(out),
+            "proximo_offset": proximo_offset,
+            "terminou": terminou,
+            "terminou_api": terminou_api,
+            "terminou_periodo": terminou_periodo,
+            "total_periodo_no_lote": len(out),
             "data": out,
         })
+
     except Exception as e:
         return safe_error(str(e), 500, {"trace": traceback.format_exc()})
 
